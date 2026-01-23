@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+asyncpg
+python-dotenv
+pydantic
+pydantic-settings
+requests
+httpx
+razorpay
+pandas
+openpyxl
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
