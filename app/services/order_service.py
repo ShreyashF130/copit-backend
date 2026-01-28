@@ -496,8 +496,8 @@ async def send_order_confirmation(phone, order_id, data, method_text):
     if order_id == "ERROR":
         await send_whatsapp_message(phone, "❌ Database error. Please try again.")
         return
-
-    shop_url = f"BASE_URL/s/{data['shop_id']}" # Update domain
+    base_url = "https://copit.in"
+    shop_url = f"{base_url}/s/{data['shop_id']}" # Update domain
     
     msg = (
         f"✅ *Order Confirmed ({method_text})*\n"
