@@ -1,27 +1,24 @@
 import asyncpg
 import os
-import ssl 
+
 class Database:
     def __init__(self):
         self.pool = None
 
     async def connect(self):
-        # This tells asyncpg: "Yes, I trust the server, just connect securely."
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-        print("🔌 Connecting to DB...")
-        
-        self.pool = await asyncpg.create_pool(
-            os.getenv("DATABASE_URL"),
-            min_size=1,
-            max_size=20,
-            statement_cache_size=0,
-            ssl=ssl_context,  # <--- CRITICAL ADDITION
-            timeout=30        # <--- Give it more time (default is 10s)
-        )
-        print("✅ DB Connected")
+        print("🔌 Connecting to DB (Session Mode)...")
+        try:
+            self.pool = await asyncpg.create_pool(
+                os.getenv("DATABASE_URL"),
+                min_size=1,
+                max_size=20,
+                ssl="require",  # Standard SSL is fine for Session mode
+                timeout=30
+            )
+            print("✅ DB Connected")
+        except Exception as e:
+            print(f"🔥 DB Connection Failed: {e}")
+            raise e
 
     async def disconnect(self):
         if self.pool:
