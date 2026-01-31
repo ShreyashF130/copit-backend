@@ -1,0 +1,2786 @@
+
+
+====================
+FILE: .\.gitignore
+====================
+
+# --- 1. SECRETS (NEVER UPLOAD THESE) ---
+.env
+.env.local
+.env.*.local
+
+# --- 2. VIRTUAL ENVIRONMENT (TOO HEAVY) ---
+venv/
+env/
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
+
+# --- 3. PYTHON JUNK ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- 4. OS JUNK ---
+.DS_Store
+Thumbs.db
+
+# --- 5. EXECUTABLES ---
+ngrok.exe
+*.exe
+
+# --- 6. IDE SETTINGS ---
+.vscode/
+.idea/
+
+====================
+FILE: .\fullcode.py
+====================
+
+import os
+
+# Files or folders to ignore
+IGNORE = {'.git', 'node_modules', '__pycache__', '.DS_Store', 'venv', 'zip','Dockerfile','.env','docker-compose.yml','gitignore','.dockerignore','requirements.txt'}
+
+def merge_codebase(output_file="codebase_summary.txt"):
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        for root, dirs, files in os.walk("."):
+            # Filter ignored directories
+            dirs[:] = [d for d in dirs if d not in IGNORE]
+            
+            for file in files:
+                if file in IGNORE or file == output_file:
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as infile:
+                        outfile.write(f"\n\n{'='*20}\n")
+                        outfile.write(f"FILE: {file_path}\n")
+                        outfile.write(f"{'='*20}\n\n")
+                        outfile.write(infile.read())
+                except (UnicodeDecodeError, PermissionError):
+                    # Skip binary files or locked files
+                    continue
+
+if __name__ == "__main__":
+    merge_codebase()
+    print("Codebase merged into codebase_summary.txt")
+
+====================
+FILE: .\app\main.py
+====================
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import asyncio
+import os
+
+
+from app.core.database import db
+from app.services.recovery_service import cart_recovery_loop
+from app.services.delivery_service import delivery_watchdog_loop
+
+from app.routers import webhook, admin, payment, storefront
+
+# 3. LIFESPAN (The On/Off Switch)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Connect to DB
+    await db.connect()
+    
+    # Turn on Background Engines
+    asyncio.create_task(cart_recovery_loop())
+    asyncio.create_task(delivery_watchdog_loop())
+    
+    print("✅ System Online: All Systems Go")
+    yield
+    
+    # C. Shutdown: Disconnect DB
+    await db.disconnect()
+
+# 4. INITIALIZE APP
+app = FastAPI(
+    title="DropBot API",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# 5. SECURITY (CORS)
+base_url = os.getenv("PUBLIC_BASE_URL")
+origins = [base_url] if base_url else ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+app.include_router(webhook.router)  
+app.include_router(admin.router, prefix="/api") 
+app.include_router(payment.router, prefix="/api")
+app.include_router(storefront.router, prefix="/api")
+
+@app.get("/")
+def health_check():
+    return {"status": "active", "environment": "production"}
+
+====================
+FILE: .\app\schemas.py
+====================
+
+from pydantic import BaseModel
+
+class StatusUpdate(BaseModel):
+    order_id: int
+    new_status: str
+
+class BroadcastRequest(BaseModel):
+    shop_id: int
+    message: str
+    image_url: str
+    limit: int
+
+class UpgradeRequest(BaseModel):
+    shop_id: int
+    plan: str
+    payment_id: str
+
+====================
+FILE: .\app\__init__.py
+====================
+
+
+
+====================
+FILE: .\app\core\config.py
+====================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID") 
+
+if not WHATSAPP_TOKEN:
+    print("⚠️ WARNING: WHATSAPP_TOKEN is missing!")
+
+====================
+FILE: .\app\core\database.py
+====================
+
+import asyncpg
+import os
+import asyncio
+import ssl
+
+class Database:
+    def __init__(self):
+        self.pool = None
+
+    async def connect(self):
+        # Create a simplified SSL context that creates less friction
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        retries = 3
+        for i in range(retries):
+            try:
+                print(f"🔌 Connecting to DB (Attempt {i+1}/{retries})...")
+                
+                self.pool = await asyncpg.create_pool(
+                    os.getenv("DATABASE_URL"),
+                    min_size=1,
+                    max_size=20,
+                    statement_cache_size=0,
+                    ssl=ctx,            # Use the relaxed SSL context
+                    timeout=60,         # ⏳ INCREASED PATIENCE
+                    command_timeout=60
+                )
+                print("✅ DB Connected")
+                return # Exit loop on success
+            
+            except Exception as e:
+                print(f"⚠️ Connection Failed: {e}")
+                if i < retries - 1:
+                    print("🔄 Retrying in 2 seconds...")
+                    await asyncio.sleep(2)
+                else:
+                    print("🔥 All connection attempts failed. Check credentials.")
+                    raise e # Crash only after 3 failed tries
+
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+
+db = Database()
+
+
+
+
+
+
+====================
+FILE: .\app\routers\admin.py
+====================
+
+from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Body
+from app.core.database import db
+from app.schemas import BroadcastRequest, StatusUpdate
+from app.utils.whatsapp import send_whatsapp_message
+from app.utils.shiprocket import get_shiprocket_token, create_shiprocket_order, generate_shipping_label
+import json
+from fastapi import UploadFile, File
+import pandas as pd
+import io
+from app.services.order_service import schedule_image_deletion
+
+router = APIRouter()
+COST_PER_MSG = 1.20
+
+
+
+@router.get("/analytics/{shop_id}")
+async def get_analytics(shop_id: int):
+    async with db.pool.acquire() as conn:
+        # 1. Headline Stats
+        stats = await conn.fetchrow("""
+            SELECT 
+                COUNT(*) as total_orders,
+                COALESCE(SUM(total_amount), 0) as total_revenue,
+                COUNT(CASE WHEN status = 'PENDING' THEN 1 END) as pending_orders
+            FROM orders 
+            WHERE shop_id = $1 AND status != 'REJECTED'
+        """, shop_id)
+        
+        # 2. Daily Graph Data (Using our SQL function)
+        daily_sales = await conn.fetch("SELECT * FROM get_daily_sales($1)", shop_id)
+        
+        # 3. Top 3 Selling Items
+        top_items = await conn.fetch("""
+            SELECT item_name, COUNT(*) as qty_sold 
+            FROM orders 
+            WHERE shop_id = $1 
+            GROUP BY item_name 
+            ORDER BY qty_sold DESC 
+            LIMIT 3
+        """, shop_id)
+
+        graph_data = []
+        for r in daily_sales:
+            graph_data.append({
+                "day": r['day'].strftime("%Y-%m-%d"), # Fixes Date Object issues
+                "total": float(r['total'])             # Fixes Decimal Object issues
+            })
+            
+  
+        return {
+            "status": "success",
+            "stats": dict(stats),
+            "graph": graph_data,
+            "top_items": [dict(r) for r in top_items]
+        }
+    
+
+@router.post("/marketing/broadcast")
+async def send_broadcast(payload: BroadcastRequest):
+    async with db.pool.acquire() as conn:
+        # 1. Check Wallet Balance & Ownership
+        shop = await conn.fetchrow("SELECT wallet_balance, phone_number FROM shops WHERE id = $1", payload.shop_id)
+        
+        if not shop:
+            raise HTTPException(status_code=404, detail="Shop not found")
+
+        # 2. Calculate Cost
+        total_cost = payload.limit * COST_PER_MSG
+        
+        if shop['wallet_balance'] < total_cost:
+            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+
+        # 3. FETCH TARGET AUDIENCE (The "Smart Priority" Logic)
+        # We select DISTINCT phone numbers, ordered by their LAST order date.
+        # This ensures we target "Active/Recent" customers first.
+        targets = await conn.fetch("""
+            SELECT DISTINCT ON (customer_phone) customer_phone, customer_name
+            FROM orders 
+            WHERE shop_id = $1 
+            ORDER BY customer_phone, created_at DESC
+            LIMIT $2
+        """, payload.shop_id, payload.limit)
+
+        if not targets:
+            return {"status": "error", "message": "No customers found"}
+
+        # 4. SEND MESSAGES (Async Loop)
+
+        sent_count = 0
+        for user in targets:
+            sent_count += 1
+
+        # 5. DEDUCT MONEY
+        actual_cost = sent_count * COST_PER_MSG
+        await conn.execute("""
+            UPDATE shops 
+            SET wallet_balance = wallet_balance - $1 
+            WHERE id = $2
+        """, actual_cost, payload.shop_id)
+
+    return {
+        "status": "success", 
+        "count": sent_count, 
+        "cost_deducted": actual_cost
+    }
+
+
+@router.post("/notify-order-update")
+async def notify_order_update(update: StatusUpdate, background_tasks: BackgroundTasks):
+    async with db.pool.acquire() as conn:
+        order = await conn.fetchrow("""
+            SELECT customer_phone, item_name, quantity, total_amount, shop_id 
+            FROM orders WHERE id = $1
+        """, update.order_id)
+        
+    if not order: return {"error": "Order not found"}
+
+    # STOCK DECREMENT (Only on PAID)
+    if update.new_status == "paid":
+        async with db.pool.acquire() as conn:
+            # Simple stock decrement (Enhancement: In future, decrement specific variant stock)
+            await conn.execute("""
+                UPDATE items SET stock_quantity = stock_quantity - $1 
+                WHERE name = $2 AND shop_id = $3
+            """, order['quantity'], order['item_name'].split('(')[0].strip(), order['shop_id'])
+            
+        background_tasks.add_task(schedule_image_deletion, update.order_id)
+
+    messages = {
+        "paid": f"✅ *Payment Verified!* Order #{update.order_id} is confirmed.",
+        "shipped": f"🚀 *Shipped!* Order #{update.order_id} is on the way.",
+        "delivered": f"🎁 *Delivered!* Order #{update.order_id} has arrived.",
+        "rejected": f"❌ *Rejected.* Payment issue with Order #{update.order_id}. Contact seller."
+    }
+    
+    msg_text = messages.get(update.new_status, f"Order #{update.order_id}: {update.new_status}")
+    send_whatsapp_message(order['customer_phone'], msg_text)
+    return {"status": "success"}
+
+
+
+@router.post("/ship/manual")
+async def ship_manual(
+    order_id: int = Body(...), 
+    courier_name: str = Body(...), 
+    tracking_link: str = Body(...)
+):
+    async with db.pool.acquire() as conn:
+        # 1. Update Order in DB & Return the Phone Number immediately
+        # We use RETURNING to avoid a second query
+        row = await conn.fetchrow("""
+            UPDATE orders 
+            SET status = 'SHIPPED', 
+                shipping_status = 'shipped',
+                shipping_provider = 'Manual',
+                courier_name = $1,
+                tracking_link = $2
+            WHERE id = $3
+            RETURNING customer_phone
+        """, courier_name, tracking_link, order_id)
+        
+        # 2. Check if Order Existed
+        if row:
+            customer_phone = row['customer_phone']
+            
+            # 3. Send WhatsApp Notification
+            msg = (
+                f"🚚 *Order Dispatched!*\n"
+                f"Courier: {courier_name}\n\n"
+                f"👇 *Track your package here:*\n{tracking_link}"
+            )
+            
+   
+            send_whatsapp_message(customer_phone, msg)
+            
+            return {"status": "success", "message": "Manual shipment updated"}
+            
+    return {"status": "error", "message": "Order not found"}
+
+@router.post("/ship/rocket")
+async def ship_via_rocket(request: Request):
+    data = await request.json()
+    order_id = data.get('order_id')
+    
+    async with db.pool.acquire() as conn:
+        # 1. Fetch Order & Shop
+        order = await conn.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
+        shop = await conn.fetchrow("SELECT * FROM shops WHERE id = $1", order['shop_id'])
+        
+        # 2. VALIDATION (Guardrails)
+        if not order['delivery_pincode']:
+            return {"status": "error", "message": "Missing Pincode! Edit order manually."}
+        
+        if not shop['shiprocket_email'] or not shop['shiprocket_password']:
+             return {"status": "error", "message": "Seller missing Shiprocket credentials."}
+
+        # 3. CONSTRUCT PAYLOAD
+        ship_data = {
+            "id": order['id'],
+            "items": json.loads(order['items']),
+            "total_amount": float(order['total_amount']),
+            "status": order['status'],
+            
+            # The "Smart Address" Mapping
+            "address": order['delivery_address'], 
+            "city": order['delivery_city'],
+            "pincode": order['delivery_pincode'],
+            "state": order['delivery_state'],
+            "customer_phone": order['customer_phone'],
+            "customer_name": "Valued Customer",
+            "pickup_location_name": shop.get('pickup_address', 'Primary')
+        }
+
+        # 4. EXECUTE SHIPMENT
+        token = get_shiprocket_token(shop['shiprocket_email'], shop['shiprocket_password'])
+        if not token: 
+            return {"status": "error", "message": "Shiprocket Login Failed"}
+        
+        response = create_shiprocket_order(token, ship_data)
+        
+        # 5. GENERATE LABEL (The Ruthless Fix) 🚀
+        if response.get('order_id'):
+            shipment_id = response['shipment_id']
+            awb_code = response.get('awb_code')
+            
+            # A. Call the Label API immediately
+            label_res = generate_shipping_label(token, shipment_id)
+            
+            # B. Extract the PDF Link
+            label_url = label_res.get('awb_print_url') if label_res else None
+            
+            # C. Save EVERYTHING to DB
+            await conn.execute("""
+                UPDATE orders SET 
+                shipping_provider = 'Shiprocket',
+                shiprocket_shipment_id = $1,
+                shiprocket_order_id = $2,
+                shipping_label_url = $3,  -- Saved for re-printing
+                shipping_awb = $4,
+                status = 'SHIPPED',
+                delivery_status = 'shipped'
+                WHERE id = $5
+            """, shipment_id, response['order_id'], label_url, awb_code, order['id'])
+            
+            # D. Send WhatsApp Notification to Customer
+            msg = (
+                f"🚀 *Order Shipped!*\n"
+                f"Tracking AWB: {awb_code}\n"
+                f"Your package is on the way!"
+            )
+            # await send_whatsapp_message(order['customer_phone'], msg) 
+            
+            return {
+                "status": "success", 
+                "awb": awb_code, 
+                "label_url": label_url # Return to Frontend to auto-open
+            }
+        else:
+            # Pass the actual error message from Shiprocket
+            return {"status": "error", "message": response.get('message', 'Unknown Error')}
+        
+
+@router.post("/inventory/bulk-upload")
+async def bulk_upload_items(
+    shop_id: int, 
+    file: UploadFile = File(...)
+):
+    print(f"📂 Processing file for Shop {shop_id}...")
+    
+    # 1. Read File
+    contents = await file.read()
+    try:
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contents))
+        elif file.filename.endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(io.BytesIO(contents))
+        else:
+            return {"status": "error", "message": "Only CSV or Excel files allowed"}
+    except Exception as e:
+        return {"status": "error", "message": f"File Error: {str(e)}"}
+
+    # 2. Standardize Column Names (Lowercase & Strip spaces)
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    # 3. Validate Required Columns
+    required_cols = ['name', 'price', 'category'] 
+    missing = [col for col in required_cols if col not in df.columns]
+    
+    if missing:
+        return {"status": "error", "message": f"Missing columns: {missing}"}
+
+    # 4. Insert Loop
+    success_count = 0
+    async with db.pool.acquire() as conn:
+        for index, row in df.iterrows():
+            try:
+                # Basic cleanup
+                name = str(row['name']).strip()
+                price = float(row['price'])
+                category = str(row['category']).strip()
+                
+                # Optional fields with defaults
+                desc = str(row.get('description', ''))
+                img = str(row.get('image_url', ''))
+                
+                # Handle NaN/Empty values safely
+                if desc == 'nan': desc = ''
+                if img == 'nan': img = ''
+                
+                # Stock 
+                stock = int(row.get('stock', 0)) # Default to 0 if not provided
+
+                # Insert into DB (Matching to Schema)
+                await conn.execute("""
+                    INSERT INTO items (
+                        shop_id, name, price, category, 
+                        description, image_url, stock_quantity
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, shop_id, name, price, category, desc, img, stock)
+                
+                success_count += 1
+            except Exception as e:
+                print(f"⚠️ Skipped Row {index}: {e}")
+                continue
+
+    return {
+        "status": "success", 
+        "message": f"Imported {success_count} items successfully!",
+        "count": success_count
+    }
+
+
+@router.post("/reviews/toggle-public")
+async def toggle_review_public(
+    review_id: int = Body(...), 
+    is_public: bool = Body(...)
+):
+    async with db.pool.acquire() as conn:
+        await conn.execute("UPDATE reviews SET is_public = $1 WHERE id = $2", is_public, review_id)
+    return {"status": "success"}
+
+
+
+====================
+FILE: .\app\routers\payment.py
+====================
+
+
+from fastapi import APIRouter, Request, HTTPException
+import razorpay
+import json
+import os
+from app.core.database import db
+
+router = APIRouter()
+
+
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+@router.post("/webhooks/razorpay")   
+async def razorpay_webhook(request: Request):
+    # 1. GET THE SIGNATURE & BODY
+    signature = request.headers.get('x-razorpay-signature')
+    body_bytes = await request.body()
+    body_str = body_bytes.decode()
+
+    # 2. VERIFY SIGNATURE (Security Check)
+    # This ensures the request actually came from Razorpay, not a hacker.
+    try:
+        client.utility.verify_webhook_signature(body_str, signature, "YOUR_WEBHOOK_SECRET")
+    except Exception as e:
+        print(f"⚠️ Webhook Signature Verification Failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid Signature")
+
+    # 3. PARSE DATA
+    event = json.loads(body_str)
+    
+    # We only care if payment is "captured" (successful)
+    if event['event'] == 'payment.captured':
+        payment = event['payload']['payment']['entity']
+        
+        # Extract Metadata (This is what we passed from Frontend)
+        notes = payment['notes'] 
+        amount = payment['amount'] / 100 # Convert paise to Rupees
+        
+        order_type = notes.get('type')  # 'credit_topup' or 'subscription'
+        shop_id = int(notes.get('shop_id'))
+
+        print(f"💰 Payment Recieved: ₹{amount} for {order_type} (Shop {shop_id})")
+
+        async with db.pool.acquire() as conn:
+            
+            # CASE A: WALLET TOP-UP
+            if order_type == 'credit_topup':
+                await conn.execute("""
+                    UPDATE shops 
+                    SET wallet_balance = wallet_balance + $1 
+                    WHERE id = $2
+                """, amount, shop_id)
+                print(f"✅ Wallet updated for Shop {shop_id}")
+
+            # CASE B: PRO SUBSCRIPTION
+            elif order_type == 'subscription':
+                # Check if already Pro to extend date, or start fresh
+                # (Simple version: Just set/reset expiry to 30 days from now)
+                await conn.execute("""
+                    UPDATE shops 
+                    SET plan_type = 'pro', 
+                        subscription_expiry = NOW() + INTERVAL '30 days' 
+                    WHERE id = $1
+                """, shop_id)
+                print(f"✅ Pro Plan activated for Shop {shop_id}")
+
+            # 4. LOG TRANSACTION 
+            await conn.execute("""
+                INSERT INTO transactions (shop_id, amount, type, payment_id, status)
+                VALUES ($1, $2, $3, $4, 'success')
+            """, shop_id, amount, order_type.upper(), payment['id'])
+
+    return {"status": "ok"}
+
+
+
+
+
+@router.post("/payment/create")
+async def create_payment_order(request: Request):
+    data = await request.json()
+    amount_rupees = data.get('amount')
+
+    shop_id = data.get('shop_id', 0) 
+    payment_type = data.get('type') 
+
+    if not amount_rupees:
+        raise HTTPException(status_code=400, detail="Amount is required")
+
+    try:
+        # 1. Create Razorpay Order
+        order_data = {
+            "amount": int(amount_rupees * 100), # Convert to Paise
+            "currency": "INR",
+            # If shop_id is 0, we treat this as a 'New User Acquisition'
+            "receipt": f"rcpt_{payment_type}_{shop_id}",
+            "notes": {
+                "shop_id": shop_id,
+                "type": payment_type,
+                "is_new_user": "true" if shop_id == 0 else "false"
+            }
+        }
+        
+        order = client.order.create(data=order_data)
+        
+        return {
+            "status": "success",
+            "order_id": order['id'],
+            "amount": order['amount'],
+            "key_id": RAZORPAY_KEY_ID 
+        }
+    except Exception as e:
+        print(f"Razorpay Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Payment Failure")
+
+
+
+
+====================
+FILE: .\app\routers\storefront.py
+====================
+
+from fastapi import APIRouter
+from app.core.database import db
+
+router = APIRouter()
+
+@router.get("/storefront/{shop_id}")
+async def get_storefront(shop_id: int):
+    async with db.pool.acquire() as conn:
+        # 1. Fetch Shop Details
+        shop = await conn.fetchrow("""
+            SELECT id, name, phone_number, plan_type, logo_url
+            FROM shops WHERE id = $1
+        """, shop_id)
+        
+        if not shop:
+            return {"status": "error", "message": "Shop not found"}
+
+        # 2. Fetch Active Products
+        # Ensuring we get stock_quantity and attributes so the frontend doesn't show "Sold Out"
+        items = await conn.fetch("""
+            SELECT id, name, price, image_url, category, description, stock_quantity, attributes
+            FROM items 
+            WHERE shop_id = $1 AND stock_quantity > 0
+            ORDER BY category, name
+        """, shop_id)
+
+        # 3. Fetch ONLY Public 4-5 Star Reviews
+        reviews = await conn.fetch("""
+            SELECT rating, comment, customer_name, created_at 
+            FROM reviews 
+            WHERE shop_id = $1 AND is_public = TRUE 
+            ORDER BY rating DESC, created_at DESC 
+            LIMIT 5
+        """, shop_id)
+
+    # Convert Record objects to dicts explicitly
+    items_list = []
+    for i in items:
+        item_dict = dict(i)
+        items_list.append(item_dict)
+
+    return {
+        "status": "success",
+        "shop": dict(shop),
+        "products": items_list,
+        "reviews": [dict(r) for r in reviews]
+    }
+
+
+# --- REVIEWS API ---
+
+@router.get("/reviews/{shop_id}")
+async def get_reviews(shop_id: int):
+    async with db.pool.acquire() as conn:
+        # Fetch all reviews
+        rows = await conn.fetch("""
+            SELECT id, rating, comment, customer_name, is_public, created_at, order_id
+            FROM reviews 
+            WHERE shop_id = $1 
+            ORDER BY created_at DESC
+        """, shop_id)
+        
+        # Fetch stats
+        stats = await conn.fetchrow("""
+            SELECT 
+                COUNT(*) as total_count,
+                COALESCE(AVG(rating), 0)::numeric(10,1) as avg_rating,
+                COUNT(CASE WHEN rating >= 4 THEN 1 END) as positive_count
+            FROM reviews WHERE shop_id = $1
+        """, shop_id)
+
+    return {
+        "status": "success",
+        "reviews": [dict(r) for r in rows],
+        "stats": dict(stats)
+    }
+
+====================
+FILE: .\app\routers\webhook.py
+====================
+
+from fastapi import APIRouter, Request, HTTPException
+import re
+import logging
+
+# 1. CORE & UTILS
+from app.core.database import db
+from app.utils.state_manager import state_manager
+from app.utils.whatsapp import  send_whatsapp_message, send_interactive_message
+
+# 2. SERVICES (The Business Logic)
+from app.services.shop_service import get_seller_phone
+
+
+from app.services.order_service import (
+    check_address_before_payment, 
+    finalize_order, 
+    save_order_to_db,
+    handle_selection_drilldown,
+    handle_web_handoff, 
+    handle_bulk_handoff 
+)
+
+# Initialize Router
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+@router.post("/webhook")
+async def receive_message(request: Request):
+    try:
+        data = await request.json()
+        
+        # 1. PARSING
+        # Standard Meta Payload Extraction
+        entry = data.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0]
+        val = changes.get("value", {})
+        
+        # Filter: Ignore status updates (sent, delivered, read)
+        if "messages" not in val: 
+            return {"status": "ok"}
+        
+        msg = val["messages"][0]
+        phone = msg["from"]
+        msg_type = msg.get("type")
+        
+        # 2. GET USER STATE
+        current_data = await state_manager.get_state(phone)
+        if not isinstance(current_data, dict):
+            current_data = {}    
+        state = current_data.get("state")
+
+        # ============================================================
+        # A. INTERACTIVE MESSAGES (Button Clicks)
+        # ============================================================
+        if msg_type == "interactive":
+            interactive = msg["interactive"]
+            selection_id = interactive["button_reply"]["id"]
+
+            # --- 1. ADDRESS CONFIRMATION ---
+            if selection_id.startswith("CONFIRM_ADDR_"):
+                try:
+                    addr_id = int(selection_id.split("_")[-1])
+                    await state_manager.update_state(phone, {"address_id": addr_id})
+                    
+                    total = current_data.get("total", 0)
+                    btns = [
+                        {"id": "pay_online", "title": "Pay Online"}, 
+                        {"id": "pay_cod", "title": "Cash on Delivery"}
+                    ]
+                    await send_interactive_message(phone, f"✅ Address Confirmed!\n💰 *Total: ₹{total}*\nSelect Payment Method:", btns)
+                except ValueError:
+                    logger.error(f"Invalid Address ID: {selection_id}")
+                return {"status": "ok"}
+
+            # --- 2. CHANGE ADDRESS ---
+
+            if selection_id == "CHANGE_ADDR":
+                # 1. Generate a Random Token
+                import uuid
+                token = str(uuid.uuid4())
+                
+                # 2. Save it to DB (Link this token to the user's phone)
+                async with db.pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO users (phone_number, magic_token) 
+                        VALUES ($1, $2)
+                        ON CONFLICT (phone_number) 
+                        DO UPDATE SET magic_token = $2
+                    """, phone, token)
+
+                # 3. Send Link with Token (Phone number is HIDDEN)
+                web_link = f"https://copit.in/fill-address?token={token}"
+                
+                msg = f"✏️ *Update Address*\nClick here securely: {web_link}"
+                await send_whatsapp_message(phone, msg)
+                return {"status": "ok"}
+
+            # --- 3. PAYMENT SELECTION ---
+            if selection_id in ["pay_online", "pay_cod"]:
+                await state_manager.update_state(phone, {"payment_method": selection_id})
+                
+                raw_addr_id = current_data.get("address_id")
+                
+                # Logic: If address ID missing, force address flow
+                if not raw_addr_id:
+                    await check_address_before_payment(phone)
+                    return {"status": "ok"}
+
+                try:
+                    addr_id = int(raw_addr_id)
+                    await finalize_order(phone, current_data, addr_id)
+                except (ValueError, TypeError):
+                    await check_address_before_payment(phone)
+                
+                return {"status": "ok"}
+
+            # --- 4. CART RECOVERY ---
+            if selection_id == "recover_checkout":
+                await check_address_before_payment(phone)
+                return {"status": "ok"}
+
+            if selection_id == "recover_cancel":
+                await state_manager.clear_state(phone)
+                await send_whatsapp_message(phone, "❌ Cart cleared.")
+                return {"status": "ok"}
+
+            return {"status": "ok"}
+        
+        # ============================================================
+        # B. TEXT MESSAGES
+        # ============================================================
+        elif msg_type == "text":
+            text = msg["text"]["body"].strip()
+
+            # --- 1. BULK ORDER TRIGGER (Regex Match) ---
+            if "buy_bulk_" in text:
+                match = re.search(r"buy_bulk_([\d:,]+)", text)
+                if match:
+                    ref_string = match.group(0) 
+                    await handle_bulk_handoff(phone, ref_string)
+                return {"status": "ok"}
+
+            # --- 2. SINGLE ITEM TRIGGER ---
+            if "buy_item_" in text:
+                match = re.search(r"buy_item_(\d+)", text)
+                if match:
+                    item_id = int(match.group(1))
+                    await handle_web_handoff(phone, item_id) 
+                return {"status": "ok"}
+            
+            # --- 3. WEBSITE RETURN ---
+            if text == "ADDRESS_DONE":
+                await check_address_before_payment(phone)
+                return {"status": "ok"}
+
+            # --- 4. REVIEWS ---
+            if text == "4-5 Stars":
+                await state_manager.update_state(phone, {
+                    "rating": 5, 
+                    "state": "awaiting_review_comment",
+                    "review_mode": "public" 
+                })
+                await send_whatsapp_message(phone, "❤️ Thank you! Could you write a short review for our website?")
+                return {"status": "ok"}
+
+            # --- 5. STATE: MANUAL ADDRESS INPUT ---
+            if state == "awaiting_manual_address":
+                parts = [p.strip() for p in text.split(",")]
+                if len(parts) >= 2:
+                    pincode, house_no = parts[0], parts[1]
+                    city = parts[2] if len(parts) > 2 else "India"
+                    
+                    async with db.pool.acquire() as conn:
+                        await conn.execute("INSERT INTO users (phone_number) VALUES ($1) ON CONFLICT DO NOTHING", phone)
+                        addr_id = await conn.fetchval("""
+                            INSERT INTO addresses (user_id, pincode, city, state, house_no, area, is_default)
+                            VALUES ($1, $2, $3, 'India', $4, 'Area', TRUE)
+                            RETURNING id
+                        """, phone, pincode, city, house_no)
+
+                    await state_manager.update_state(phone, {"state": "active", "address_id": addr_id}) 
+                    btns = [{"id": "pay_online", "title": "Pay Online"}, {"id": "pay_cod", "title": "Cash on Delivery"}]
+                    await send_interactive_message(phone, "✅ Address Saved! Select Payment Method:", btns)
+                else:
+                    await send_whatsapp_message(phone, "⚠️ Format: *Pincode, House No, City*")
+                return {"status": "ok"}
+
+            # --- 6. STATE: UPSELL DECISION ---
+            elif state == "awaiting_upsell_decision":
+                user_reply = text.strip().lower()
+                if user_reply in ["yes", "add", "ok", "y", "1"]:
+                    upsell_item = current_data.get('upsell_item', {})
+                    shop_id = current_data.get('shop_id')
+                    original_order_id = current_data.get('linked_order_id')
+                    
+                    # Inherit address from previous order
+                    address_payload = {}
+                    if original_order_id:
+                        async with db.pool.acquire() as conn:
+                            prev = await conn.fetchrow("SELECT delivery_address, delivery_pincode, delivery_city, delivery_state FROM orders WHERE id = $1", original_order_id)
+                            if prev:
+                                address_payload = {
+                                    "address": prev['delivery_address'],
+                                    "pincode": prev['delivery_pincode'],
+                                    "city": prev['delivery_city'],
+                                    "state": prev['delivery_state']
+                                }
+
+                    new_order = {
+                        "phone": phone, "shop_id": shop_id,
+                        "total": upsell_item.get('price', 0),
+                        "item_name": upsell_item.get('name', 'Add-on'), 
+                        "qty": 1, "payment_method": "COD", "status": "COD",
+                        **address_payload
+                    }
+                    order_id = await save_order_to_db(new_order)
+                    await send_whatsapp_message(phone, f"🎉 Added {upsell_item.get('name')} for ₹{upsell_item.get('price')}.")
+                    
+                    seller_phone = await get_seller_phone(shop_id)
+                    if seller_phone:
+                        await send_whatsapp_message(seller_phone, f"🔥 *UPSELL CONVERTED!* Order #{order_id}")
+                else:
+                    await send_whatsapp_message(phone, "No problem! Your original order is processed. ✅")
+                
+                await state_manager.clear_state(phone)
+                return {"status": "ok"}
+
+            # --- 7. STATE: DRILLDOWN (Category/Product Selection) ---
+            elif state == "awaiting_selection":
+                await handle_selection_drilldown(phone, text, current_data)
+                return {"status": "ok"}
+
+            # --- 8. STATE: QUANTITY & STOCK CHECK ---
+            elif state == "awaiting_qty" and text.isdigit():
+                qty = int(text)
+                raw_item_id = current_data.get('item_id')
+                
+                if not raw_item_id:
+                     await send_whatsapp_message(phone, "⚠️ Session Expired.")
+                     await state_manager.clear_state(phone)
+                     return {"status": "ok"}
+                
+                item_id = int(raw_item_id)
+                if qty < 1:
+                    await send_whatsapp_message(phone, "⚠️ Min quantity is 1.")
+                    return {"status": "ok"}
+
+                async with db.pool.acquire() as conn:
+                    # Fetch Stock
+                    row = await conn.fetchrow("SELECT stock_count, name, price FROM items WHERE id = $1", item_id)
+                    if not row:
+                        await send_whatsapp_message(phone, "❌ Item not found.")
+                        return {"status": "ok"}
+
+                    live_stock = row['stock_count'] 
+                    item_name = row['name']
+                    price = float(row['price'])
+
+                    if live_stock == 0:
+                        await send_whatsapp_message(phone, f"😢 *{item_name} is SOLD OUT.*")
+                        await state_manager.clear_state(phone)
+                        return {"status": "ok"}
+
+                    if qty > live_stock:
+                        await send_whatsapp_message(phone, f"⚠️ Only *{live_stock}* left. Type *{live_stock}* to buy all!")
+                        return {"status": "ok"}
+
+                # Stock Valid -> Update State -> Address Flow
+                await state_manager.update_state(phone, {
+                    "total": price * qty,
+                    "qty": qty,
+                    "name": item_name, 
+                    "price": price
+                })
+                await check_address_before_payment(phone)
+                return {"status": "ok"}
+
+    except Exception as e:
+        logger.error(f"🔥 Webhook Error: {e}", exc_info=True)
+        
+    return {"status": "ok"}
+
+====================
+FILE: .\app\services\delivery_service.py
+====================
+
+from app.core.database import db
+from app.utils.shiprocket import get_shiprocket_token, check_shiprocket_status
+from app.utils.whatsapp import send_whatsapp_message
+import asyncio
+from app.utils.state_manager import state_manager
+
+async def delivery_watchdog_loop():
+    print("🐶 Delivery Watchdog Started...")
+    while True:
+        try:
+            async with db.pool.acquire() as conn:
+                # 1. Find orders that are SHIPPED but not yet DELIVERED (and used Shiprocket)
+                orders = await conn.fetch("""
+                    SELECT o.id, o.shiprocket_shipment_id, o.customer_phone, o.shop_id,
+                           s.shiprocket_email, s.shiprocket_password
+                    FROM orders o
+                    JOIN shops s ON o.shop_id = s.id
+                    WHERE o.delivery_status = 'shipped' 
+                      AND o.shipping_provider = 'Shiprocket'
+                """)
+
+                for order in orders:
+                    # 2. Get Token (In production, cache this!)
+                    token = get_shiprocket_token(order['shiprocket_email'], order['shiprocket_password'])
+                    
+                    if token:
+                        # 3. Check Status
+                        status = check_shiprocket_status(token, order['shiprocket_shipment_id'])
+                        
+                        if status == "DELIVERED":
+                            print(f"🎉 Order #{order['id']} is Delivered!")
+                            
+                            # 4. Update Database
+                            await conn.execute("""
+                                UPDATE orders 
+                                SET delivery_status = 'delivered', status = 'DELIVERED', is_review_requested = TRUE
+                                WHERE id = $1
+                            """, order['id'])
+                            
+                            # 5. TRIGGER REVIEW REQUEST (Strategy 3)
+                            # We send a text message asking for a rating immediately.
+                            
+                            msg = (
+                                f"📦 *Delivered!* We hope you love your order.\n\n"
+                                f"⭐ How would you rate your experience?\n"
+                                f"Reply with a number *1 to 5*."
+                            )
+                            send_whatsapp_message(order['customer_phone'], msg)
+                            
+                            # 6. Set State to Capture Rating
+                            await state_manager.set_state(order['customer_phone'], {
+                                "state": "awaiting_review_rating", 
+                                "shop_id": order['shop_id'],
+                                "order_id": order['id']
+                            })
+
+            # Sleep for 1 hour to avoid hitting API limits too hard
+            await asyncio.sleep(3600) 
+            
+        except Exception as e:
+            print(f"🔥 Watchdog Error: {e}")
+            await asyncio.sleep(3600)
+
+====================
+FILE: .\app\services\inventory_service.py
+====================
+
+from app.utils.whatsapp import send_whatsapp_message
+from app.utils.state_manager import state_manager
+
+
+async def handle_selection_drilldown(phone, text, current_data):
+    """
+    Handles the user's input for specs (e.g., 'Red', 'XL').
+    """
+    attrs = current_data.get("attributes", {})
+    specs = attrs.get("specs", [])
+    idx = current_data.get("current_spec_index", 0)
+    
+    # Validate Selection
+    current_spec_obj = specs[idx]
+    valid_options = [opt.strip().lower() for opt in current_spec_obj['options']]
+    
+    if text.strip().lower() not in valid_options:
+        options_str = ", ".join(current_spec_obj['options'])
+        send_whatsapp_message(phone, f"❌ Invalid choice. Please pick: {options_str}")
+        return
+
+    # Save Selection
+    selected_value = next((o for o in current_spec_obj['options'] if o.lower() == text.strip().lower()), text)
+    user_selections = current_data.get("user_selections", {})
+    user_selections[current_spec_obj['name']] = selected_value
+    
+    # Check if more specs exist
+    if idx + 1 < len(specs):
+        # Ask Next Spec
+        next_spec = specs[idx + 1]
+        options_str = ", ".join(next_spec['options'])
+        
+        await state_manager.set_state(phone, {
+            "user_selections": user_selections,
+            "current_spec_index": idx + 1
+        })
+        send_whatsapp_message(phone, f"✅ Selected {selected_value}.\nNow select *{next_spec['name']}*:\n({options_str})")
+    else:
+        # All Specs Selected -> Find Variant Logic
+        # Construct title to match (e.g., "Red / XL")
+        variant_title = " / ".join(user_selections.values())
+        
+        # Find matching variant in JSON
+        variants = attrs.get('variants', [])
+        found_variant = next((v for v in variants if v['title'] == variant_title), None)
+        
+        final_price = float(found_variant['price']) if found_variant and float(found_variant['price']) > 0 else current_data['base_price']
+        
+        # Save Final State
+        formatted_options = f"({variant_title})"
+        await state_manager.set_state(phone, {
+            "state": "awaiting_qty",
+            "price": final_price,
+            "selected_options": formatted_options
+        })
+        
+        msg = f"✅ *Configuration Complete!*\nVariaton: {variant_title}\n💰 Price: ₹{final_price}\n\n🔢 *How many would you like?*"
+        send_whatsapp_message(phone, msg)
+
+====================
+FILE: .\app\services\marketing_service.py
+====================
+
+import asyncio
+from app.core.database import db
+from app.utils.state_manager import state_manager
+from app.utils.whatsapp import send_whatsapp_message, send_image_message
+
+async def trigger_upsell_flow(phone, shop_id, original_order_id):
+    """
+    Checks if shop has upsell enabled and sends the pitch.
+    """
+    # 1. Use the global DB pool
+    async with db.pool.acquire() as conn:
+        # Fetch Upsell Config
+        shop = await conn.fetchrow("""
+            SELECT upsell_item_id, upsell_discount, is_upsell_enabled 
+            FROM shops WHERE id = $1
+        """, shop_id)
+        
+        if not shop or not shop['is_upsell_enabled'] or not shop['upsell_item_id']:
+            return # Upsell not active
+
+        # Fetch Item Details
+        item = await conn.fetchrow("SELECT name, price, image_url FROM items WHERE id = $1", shop['upsell_item_id'])
+        
+        if not item: return
+
+        # 2. Calculate Deal
+        original_price = float(item['price'])
+        discount_percent = int(shop['upsell_discount'])
+        discount_amount = (original_price * discount_percent) / 100
+        offer_price = int(original_price - discount_amount)
+        
+        # 3. Wait 5 Seconds (Psychological Pause)
+        await asyncio.sleep(5) 
+
+        # 4. Send The Pitch
+        msg = (
+            f"🔥 *WAIT! Exclusive One-Time Offer* 🔥\n\n"
+            f"Since you just ordered, you unlocked a deal on our Best Seller:\n"
+            f"📦 *{item['name']}*\n"
+            f"❌ ~~₹{original_price}~~\n"
+            f"✅ *₹{offer_price}* (Only for you!)\n\n"
+            f"👇 *Reply YES to add this to your shipment!*"
+        )
+        
+        # If item has image, send it (using await)
+        if item['image_url']:
+            await send_image_message(phone, item['image_url'], caption=msg)
+        else:
+            await send_whatsapp_message(phone, msg)
+
+        # 5. Set State to Capture 'YES'
+        await state_manager.update_state(phone, {
+            "state": "awaiting_upsell_decision",
+            "shop_id": shop_id,
+            "upsell_item": {
+                "id": shop['upsell_item_id'],
+                "name": item['name'],
+                "price": offer_price
+            },
+            "linked_order_id": original_order_id
+        })
+
+====================
+FILE: .\app\services\order_service.py
+====================
+
+from app.utils.whatsapp import send_whatsapp_message, send_interactive_message,send_image_message
+from app.utils.state_manager import state_manager
+import uuid
+import json
+import asyncio
+from app.core.database import db
+import asyncio
+import logging
+
+
+async def finalize_order(phone, data, addr_id):
+    """
+    FINALIZER:
+    1. Fetches Address & Shop Settings.
+    2. Saves Order (Pending or COD).
+    3. Routes to Razorpay, UPI, or COD Confirmation.
+    """
+    shop_id = data.get("shop_id")
+    total_amount = float(data.get("total", 0))
+    payment_method = data.get("payment_method", "pay_cod")
+    
+    # 1. FETCH ADDRESS & SHOP CREDENTIALS IN ONE GO
+    async with db.pool.acquire() as conn:
+        addr = await conn.fetchrow("SELECT * FROM addresses WHERE id = $1", int(addr_id))
+        
+        shop = await conn.fetchrow("""
+            SELECT name, plan_type, active_payment_method, 
+                   razorpay_key_id, razorpay_key_secret, upi_id 
+            FROM shops WHERE id = $1
+        """, int(shop_id))
+
+    if not addr:
+        await send_whatsapp_message(phone, "❌ Critical Error: Address not found.")
+        return
+
+    # Construct Address String
+    full_addr_str = addr['full_address']
+    if not full_addr_str:
+        parts = [addr['house_no'], addr['area'], addr['city'], addr['pincode']]
+        full_addr_str = ", ".join([p for p in parts if p])
+
+    # 2. DETERMINE INITIAL STATUS
+    # If Online, we save as 'PENDING_PAYMENT' first.
+    status_text = "COD" if payment_method == "pay_cod" else "PENDING_PAYMENT"
+
+    # 3. PREPARE PAYLOAD
+    order_payload = {
+        "phone": phone,
+        "item_name": data.get("name", "Unknown Item"),
+        "qty": int(data.get("qty", 1)),
+        "total": total_amount,
+        "payment_method": "COD" if payment_method == "pay_cod" else "ONLINE",
+        "shop_id": shop_id,
+        "address": full_addr_str,
+        "pincode": addr['pincode'],
+        "city": addr['city'],
+        "state": addr['state'],
+        "status": status_text
+    }
+
+    # 4. SAVE TO DB
+    order_id = await save_order_to_db(order_payload)
+    
+    if not order_id:
+        await send_whatsapp_message(phone, "❌ Database Error. Please retry.")
+        return
+
+    # 5. ROUTING LOGIC (The Brain 🧠)
+
+    # --- CASE A: CASH ON DELIVERY ---
+    if payment_method == "pay_cod":
+        msg = (
+            f"🎉 *Order Placed Successfully!* 🎉\n"
+            f"🆔 Order #{order_id}\n"
+            f"📦 Item: {order_payload['item_name']} (x{order_payload['qty']})\n"
+            f"💰 Total: ₹{total_amount}\n"
+            f"📍 Ship To: {order_payload['city']}\n\n"
+            "We will update you when it ships! 🚚"
+        )
+        await send_whatsapp_message(phone, msg)
+        await state_manager.clear_state(phone)
+        
+        # Trigger Upsell if enabled
+        # await trigger_upsell_flow(phone, shop_id, order_id) 
+        return
+
+    # --- CASE B: ONLINE PAYMENT ---
+    elif payment_method == "pay_online":
+        
+        # LOGIC: Can we use Razorpay?
+        # Must be PRO plan + Razorpay Selected + Keys Exist
+        use_razorpay = (
+            (shop['plan_type'] == 'pro') and 
+            (shop['active_payment_method'] == 'razorpay') and 
+            shop['razorpay_key_id'] and 
+            shop['razorpay_key_secret']
+        )
+
+        # SUB-CASE B1: RAZORPAY AUTOMATION 🤖
+        if use_razorpay:
+            try:
+                import razorpay
+                rzp = razorpay.Client(auth=(shop['razorpay_key_id'], shop['razorpay_key_secret']))
+                
+                link_data = {
+                    "amount": int(total_amount * 100), # Paise
+                    "currency": "INR",
+                    "description": f"Order #{order_id}",
+                    "customer": {"contact": phone},
+                    "notify": {"sms": True, "email": False},
+                    "callback_url": "https://copit.in/payment-success", # Optional
+                    "callback_method": "get"
+                }
+                
+                payment_link = rzp.payment_link.create(link_data)
+                short_url = payment_link['short_url']
+                
+                msg = (
+                    f"💳 *Complete Your Payment*\n"
+                    f"🆔 Order #{order_id}\n"
+                    f"💰 Amount: ₹{total_amount}\n\n"
+                    f"👇 *Tap to Pay Securely:*\n{short_url}\n\n"
+                    f"_(Order confirms automatically after payment)_"
+                )
+                await send_whatsapp_message(phone, msg)
+                
+                # Save Link ID to State (for verification later if needed)
+                await state_manager.update_state(phone, {"payment_link_id": payment_link['id']})
+                return
+
+            except Exception as e:
+                print(f"🔥 Razorpay Failed: {e}")
+                # Fallback to UPI if Razorpay crashes
+        
+        # SUB-CASE B2: MANUAL UPI (The Fallback) 🏦
+        if shop['upi_id']:
+            # Replace with your actual base URL
+            base_url = "https://copit.in" 
+            pay_url = f"{base_url}/pay/manual?shop={shop_id}&amount={total_amount}&order={order_id}"
+            
+            msg = (
+                f"🏦 *Direct Payment Link*\n"
+                f"Amount: ₹{total_amount}\n\n"
+                f"👇 *Tap to Pay via UPI:*\n{pay_url}\n\n"
+                f"⚠️ *Important:* After paying, please send a *Screenshot* here to confirm."
+            )
+            
+            # Update state to wait for screenshot
+            await state_manager.set_state(phone, {
+                "state": "awaiting_screenshot", 
+                "order_id": order_id,
+                "shop_id": shop_id
+            })
+            await send_whatsapp_message(phone, msg)
+        else:
+            await send_whatsapp_message(phone, "❌ Seller has not set up payments. Please choose COD.")
+
+
+async def save_order_to_db(data):
+    """
+    Inserts data using the Single-Item Schema.
+    """
+    async with db.pool.acquire() as conn:
+        query = """
+            INSERT INTO orders (
+                customer_phone, 
+                item_name, 
+                quantity, 
+                total_amount, 
+                payment_method, 
+                delivery_address, 
+                delivery_pincode, 
+                delivery_city, 
+                delivery_state,
+                shop_id,
+                status,
+                payment_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+            RETURNING id
+        """
+        
+        # Use .get() with defaults to avoid KeyErrors
+        order_id = await conn.fetchval(query,
+            data['phone'],
+            data['item_name'],
+            data['qty'],
+            data['total'],
+            data['payment_method'],
+            data['address'],
+            data['pincode'],
+            data['city'],
+            data['state'],
+            data['shop_id'],
+            data['status'] # Passed from finalize_order
+        )
+        return order_id
+    
+async def check_address_before_payment(phone):
+    async with db.pool.acquire() as conn:
+        # 1. Check for Existing Address
+        row = await conn.fetchrow("""
+            SELECT id, full_address, pincode, city, house_no, area 
+            FROM addresses 
+            WHERE user_id = $1 
+            ORDER BY created_at DESC LIMIT 1
+        """, phone)
+
+        if row:
+            # [Existing Logic] Address Found -> Show Confirm Button
+            addr_id = row['id']
+            parts = [p for p in [row['house_no'], row['area'], row['city'], row['pincode']] if p]
+            display_addr = ", ".join(parts) or row['full_address']
+
+            msg = f"📍 *Confirm Delivery Address:*\n\n{display_addr}"
+            btns = [
+                {"id": f"CONFIRM_ADDR_{addr_id}", "title": "✅ Yes, Ship Here"},
+                {"id": "CHANGE_ADDR", "title": "✏️ Change Address"}
+            ]
+            send_interactive_message(phone, msg, btns)
+        
+        else:
+            # 🛡️ SECURITY FIX: Generate Magic Token
+            token = str(uuid.uuid4()) # Generates random string like 'f47ac10b-58cc...'
+            
+            # Save token to DB so we can verify it later
+            # We use UPSERT (Insert or Update) to ensure phone exists
+            await conn.execute("""
+                INSERT INTO users (phone_number, magic_token) 
+                VALUES ($1, $2)
+                ON CONFLICT (phone_number) 
+                DO UPDATE SET magic_token = $2
+            """, phone, token)
+
+            # Generate Secure Link (NO PHONE NUMBER IN URL)
+            # Replace with your actual Vercel domain
+            web_link = f"https://your-site.vercel.app/mobile-address?token={token}"
+            
+            msg = (
+                "🚚 *Shipping Details Needed*\n"
+                "To ensure safe delivery, please fill your address securely:\n\n"
+                f"🔗 *Click here:* {web_link}"
+            )
+            await send_whatsapp_message(phone, msg)
+
+
+async def handle_web_handoff(phone, item_id, referrer=None):
+    async with db.pool.acquire() as conn:
+        item = await conn.fetchrow("SELECT * FROM items WHERE id = $1", item_id)
+    
+    if not item:
+        await send_whatsapp_message(phone, "❌ Item discontinued or not found.")
+        return
+
+    
+    # 1. Fix Attributes
+    attrs = item.get('attributes')
+    if isinstance(attrs, str):
+        try:
+            attrs = json.loads(attrs)
+        except:
+            attrs = {}
+    elif attrs is None:
+        attrs = {}
+
+    # 2. Fix Options
+    options = item.get('options')
+    if isinstance(options, str):
+        try:
+            options = json.loads(options)
+        except:
+            options = []
+    elif options is None:
+        options = []
+        
+    # ============================================================
+
+    # Now 'attrs' is guaranteed to be a Dict, so .get() will work
+    has_variants = attrs.get('has_complex_variants', False)
+
+    # Initialize State
+    base_state = {
+        "item_id": item['id'],
+        "name": item['name'],
+        "base_price": float(item['price']),
+        "price": float(item['price']),
+        "shop_id": item['shop_id'],
+        "description": item.get('description', ''),
+        "referrer": referrer,
+        
+        # Save parsed data
+        "attributes": attrs,
+        "options": options,
+        
+        # Flow Flags
+        "has_variants": has_variants,
+        "selected_options": {}, # e.g. {"Size": "M", "Color": "Red"}
+        "current_step_index": 0 
+    }
+
+    # LOGIC A: COMPLEX VARIANTS (Step-by-Step)
+    if has_variants and options:
+        # Save state and trigger the first question (Drilldown)
+        # We need to know WHICH question to ask first.
+        # usually options is list of dicts: [{"name": "Size", "values": [...]}, ...]
+        first_option = options[0]
+        
+        await state_manager.update_state(phone, {
+            **base_state,
+            "state": "awaiting_selection",
+            "qty": 1
+        })
+        
+        # Ask first question
+        btn_rows = [{"id": f"VAR_{val[:20]}", "title": val} for val in first_option['values']]
+        msg = f"🛒 *{item['name']}*\nSelect *{first_option['name']}*:"
+        send_interactive_message(phone, msg, btn_rows)
+
+    # LOGIC B: SIMPLE PRODUCT (Directly ask Quantity)
+    else:
+        # Go straight to Quantity
+        await state_manager.update_state(phone, {
+            **base_state,
+            "state": "awaiting_qty",
+            "qty": 1
+        })
+
+        # Send Product Image + Caption
+        caption = (
+            f"🛍️ *{item['name']}*\n"
+            f"💰 Price: ₹{item['price']}\n\n"
+            f"{item.get('description', '')}\n\n"
+            "🔢 *Please reply with the Quantity* (e.g. 1, 2, 5)"
+        )
+        
+        # If image exists, send it. Else text.
+        img_url = item.get('image_url')
+        if img_url and "http" in img_url:
+            await send_image_message(phone, img_url, caption)
+        else:
+            send_whatsapp_message(phone, caption)
+
+
+async def validate_coupon(shop_id, code):
+    async with db.pool.acquire() as conn:
+        coupon = await conn.fetchrow("""
+            SELECT * FROM coupons 
+            WHERE shop_id = $1 AND code = $2 AND is_active = TRUE
+        """, shop_id, code.upper())
+    return coupon
+
+
+
+async def handle_bulk_handoff(phone, ref_string):
+    print(f"🕵️ DEBUG: Processing Bulk Order: {ref_string}")
+    
+    try:
+        # 1. Separate Items from Coupon
+        coupon_code = None
+        if "_COUPON:" in ref_string:
+            parts = ref_string.split("_COUPON:")
+            items_part = parts[0]
+            coupon_code = parts[1].strip()
+        else:
+            items_part = ref_string
+
+        # Clean up the items string
+        raw_items = items_part.replace("buy_bulk_", "").split(",")
+        
+        cart_items = []
+        subtotal = 0
+        shop_id = None
+        seller_phone = None
+        summary_text = ""
+        hero_image_url = None 
+
+        async with db.pool.acquire() as conn:
+            for entry in raw_items:
+                if ":" not in entry: continue
+                item_id, qty = map(int, entry.split(":"))
+                
+                # Fetch Item
+                item = await conn.fetchrow("""
+                    SELECT i.name, i.price, i.image_url, i.shop_id, s.phone_number, s.name as shop_name
+                    FROM items i JOIN shops s ON i.shop_id = s.id 
+                    WHERE i.id = $1
+                """, item_id)
+                
+                if item:
+                    line_total = float(item['price']) * qty
+                    subtotal += line_total
+                    shop_id = item['shop_id']
+                    seller_phone = item['phone_number']
+                    
+                    if not hero_image_url and item['image_url']:
+                        hero_image_url = item['image_url']
+                    
+                    cart_items.append({
+                        "name": item['name'],
+                        "qty": qty,
+                        "price": float(item['price'])
+                    })
+                    summary_text += f"• {item['name']} x{qty}\n"
+
+        if not cart_items:
+            print("❌ Error: No valid items found")
+            return
+
+        # 2 Verify Coupon in Backend
+        discount_amount = 0
+        applied_coupon_code = None
+        
+        if coupon_code:
+            # Re-use validate_coupon function
+            coupon = await validate_coupon(shop_id, coupon_code)
+            
+            if coupon:
+                applied_coupon_code = coupon['code']
+                if coupon['discount_type'] == 'percent':
+                    discount_amount = (subtotal * float(coupon['value'])) / 100
+                else:
+                    discount_amount = float(coupon['value'])
+                print(f"✅ Coupon {coupon_code} Validated. Discount: ₹{discount_amount}")
+            else:
+                print(f"⚠️ Invalid Coupon Attempt: {coupon_code}")
+
+        final_total = max(0, subtotal - discount_amount)
+
+        # 3. Update State
+        await state_manager.set_state(phone, {
+            "state": "awaiting_payment_method", 
+            "cart": cart_items,
+            "total": final_total,          # The amount they must pay
+            "subtotal": subtotal,          # Original amount
+            "discount": discount_amount,   # Savings
+            "shop_id": shop_id,
+            "seller_phone": seller_phone,
+            "applied_coupon": applied_coupon_code
+        })
+
+        # 4. Send Hero Image
+        if hero_image_url:
+            extra_count = len(cart_items) - 1 
+            item_word = "item" if extra_count == 1 else "items"
+            caption = f"🛒 Your selection looks ready! (+{extra_count} more {item_word})" if extra_count > 0 else "🛒 Your selection looks ready!"
+            await send_image_message(phone, hero_image_url, caption=caption)
+
+        # 5. Construct Summary Message
+        buttons = [
+            {"id": "pay_online", "title": "Pay Online"},
+            {"id": "pay_cod", "title": "Cash on Delivery"}
+        ]
+        
+        msg = (
+            f"🧾 *Order Summary*\n"
+            f"------------------\n"
+            f"{summary_text}"
+            f"------------------\n"
+            f"📝 Subtotal: ₹{subtotal}\n"
+        )
+        
+        if applied_coupon_code:
+            msg += f"🏷️ Coupon ({applied_coupon_code}): -₹{discount_amount}\n"
+            
+        msg += (
+            f"💰 *Final Total: ₹{final_total}*\n\n"
+            f"Select payment method to confirm:"
+        )
+        
+        await send_interactive_message(phone, msg, buttons)
+
+    except Exception as e:
+        print(f"🔥 CRITICAL ERROR in Bulk Handoff: {e}")
+        await send_whatsapp_message(phone, "❌ Error processing cart. Please try again.")
+
+
+# app/services/order_service.py
+
+
+
+async def schedule_image_deletion(order_id: int):
+    """
+    Background task to clear screenshot references after 30 minutes
+    to save storage space/privacy.
+    """
+    # Wait for 30 minutes
+    await asyncio.sleep(1800) 
+    
+    # Use the modular DB connection
+    async with db.pool.acquire() as conn:
+        await conn.execute("UPDATE orders SET screenshot_id = NULL WHERE id = $1", order_id)
+        
+    print(f"🧹 Storage Purged: Order #{order_id}")
+
+
+async def send_order_confirmation(phone, order_id, data, method_text):
+    if order_id == "ERROR":
+        await send_whatsapp_message(phone, "❌ Database error. Please try again.")
+        return
+    base_url = "https://copit.in"
+    shop_url = f"{base_url}/s/{data['shop_id']}" # Update domain
+    
+    msg = (
+        f"✅ *Order Confirmed ({method_text})*\n"
+        f"Order ID: #{order_id}\n"
+        f"📦 We will notify you when shipped!\n\n"
+        f"Browse more: {shop_url}"
+    )
+    await send_whatsapp_message(phone, msg)
+    
+    # Notify Seller
+    seller_phone = data.get('seller_phone')
+    if seller_phone:
+        await send_whatsapp_message(seller_phone, f"🚨 *NEW ORDER!* (#{order_id})\nMethod: {method_text}")
+    
+    await state_manager.clear_state(phone)
+
+
+async def get_address_string(addr_id):
+    """
+    Converts Address ID -> Full String for the 'orders' table
+    """
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT house_no, area, city, pincode 
+            FROM addresses WHERE id = $1
+        """, int(addr_id))
+        
+        if row:
+            return f"{row['house_no']}, {row['area']}, {row['city']} - {row['pincode']}"
+        return "Address Not Found"
+    
+
+
+
+async def send_address_flow(phone):
+    """
+    RUTHLESS FALLBACK: 
+    Since Meta Integrity blocked the Flow, we simply ASK the user to type it.
+    """
+    # 1. Update State to listen for the address
+    await state_manager.update_state(phone, {
+        "state": "awaiting_manual_address"
+    })
+
+    # 2. Send Simple Text Prompt
+    msg = (
+        "🚚 *Shipping Details Needed*\n\n"
+        "Since this is your first order, please type your address below in this format:\n\n"
+        "👉 *Pincode, House No, City*\n"
+        "_(Example: 400050, Flat 101, Mumbai)_"
+    )
+    await send_whatsapp_message(phone, msg)
+
+
+async def check_and_request_address(phone):
+    async with db.pool.acquire() as conn:
+        # RUTHLESS FIX: Join strictly on phone_number.
+        # We assume addresses.user_id stores the phone number string.
+        
+        row = await conn.fetchrow("""
+            SELECT a.id, a.full_address, a.pincode, a.city 
+            FROM addresses a
+            WHERE a.user_id = $1
+            ORDER BY a.created_at DESC LIMIT 1
+        """, phone)
+        
+        if row:
+            # ✅ Address Found
+            addr_id = row['id']
+            # Handle potential NULLs gracefully
+            full_addr = row['full_address'] or f"{row['house_no']}, {row['area']}, {row['city']} - {row['pincode']}"
+            
+            msg = f"📍 We found a saved address:\n\n*{full_addr}*\n\nShip to this address?"
+            
+            btns = [
+                {"id": f"USE_OLD_ADDR_{addr_id}", "title": "✅ Yes, Ship Here"},
+                {"id": "NEW_ADDR_FLOW", "title": "📝 Add New Address"}
+            ]
+            await send_interactive_message(phone, msg, btns)
+        else:
+            # ❌ No Address Found
+            await send_address_flow(phone)
+
+
+
+async def check_address_before_payment(phone):
+    async with db.pool.acquire() as conn:
+        # 1. Check for Existing Address
+        row = await conn.fetchrow("""
+            SELECT id, full_address, pincode, city, house_no, area 
+            FROM addresses 
+            WHERE user_id = $1 
+            ORDER BY created_at DESC LIMIT 1
+        """, phone)
+
+        if row:
+            # [Existing Logic] Address Found -> Show Confirm Button
+            addr_id = row['id']
+            parts = [p for p in [row['house_no'], row['area'], row['city'], row['pincode']] if p]
+            display_addr = ", ".join(parts) or row['full_address']
+
+            msg = f"📍 *Confirm Delivery Address:*\n\n{display_addr}"
+            btns = [
+                {"id": f"CONFIRM_ADDR_{addr_id}", "title": "✅ Yes, Ship Here"},
+                {"id": "CHANGE_ADDR", "title": "✏️ Change Address"}
+            ]
+            await send_interactive_message(phone, msg, btns)
+        
+        else:
+            # 🛡️ SECURITY FIX: Generate Magic Token
+            token = str(uuid.uuid4()) # Generates random string like 'f47ac10b-58cc...'
+            
+            # Save token to DB so we can verify it later
+            # We use UPSERT (Insert or Update) to ensure phone exists
+            await conn.execute("""
+                INSERT INTO users (phone_number, magic_token) 
+                VALUES ($1, $2)
+                ON CONFLICT (phone_number) 
+                DO UPDATE SET magic_token = $2
+            """, phone, token)
+
+            # Generate Secure Link (NO PHONE NUMBER IN URL)
+            # Replace with your actual Vercel domain
+            web_link = f"https://your-site.vercel.app/mobile-address?token={token}"
+            
+            msg = (
+                "🚚 *Shipping Details Needed*\n"
+                "To ensure safe delivery, please fill your address securely:\n\n"
+                f"🔗 *Click here:* {web_link}"
+            )
+            await send_whatsapp_message(phone, msg)
+
+
+async def save_order_to_db(data):
+    """
+    Inserts data using the Single-Item Schema.
+    """
+    async with db.pool.acquire() as conn:
+        query = """
+            INSERT INTO orders (
+                customer_phone, 
+                item_name, 
+                quantity, 
+                total_amount, 
+                payment_method, 
+                delivery_address, 
+                delivery_pincode, 
+                delivery_city, 
+                delivery_state,
+                shop_id,
+                status,
+                payment_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+            RETURNING id
+        """
+        
+        # Use .get() with defaults to avoid KeyErrors
+        order_id = await conn.fetchval(query,
+            data['phone'],
+            data['item_name'],
+            data['qty'],
+            data['total'],
+            data['payment_method'],
+            data['address'],
+            data['pincode'],
+            data['city'],
+            data['state'],
+            data['shop_id'],
+            data['status'] # Passed from finalize_order
+        )
+        return order_id
+
+async def finalize_order(phone, data, addr_id):
+    """
+    RUTHLESS FINALIZER:
+    1. Fetches Address & Shop Settings.
+    2. Saves Order (Pending or COD).
+    3. Routes to Razorpay, UPI, or COD Confirmation.
+    """
+    shop_id = data.get("shop_id")
+    total_amount = float(data.get("total", 0))
+    payment_method = data.get("payment_method", "pay_cod")
+    
+    # 1. FETCH ADDRESS & SHOP CREDENTIALS IN ONE GO
+    async with db.pool.acquire() as conn:
+        addr = await conn.fetchrow("SELECT * FROM addresses WHERE id = $1", int(addr_id))
+        
+        shop = await conn.fetchrow("""
+            SELECT name, plan_type, active_payment_method, 
+                   razorpay_key_id, razorpay_key_secret, upi_id 
+            FROM shops WHERE id = $1
+        """, int(shop_id))
+
+    if not addr:
+        await send_whatsapp_message(phone, "❌ Critical Error: Address not found.")
+        return
+
+    # Construct Address String
+    full_addr_str = addr['full_address']
+    if not full_addr_str:
+        parts = [addr['house_no'], addr['area'], addr['city'], addr['pincode']]
+        full_addr_str = ", ".join([p for p in parts if p])
+
+    # 2. DETERMINE INITIAL STATUS
+    # If Online, we save as 'PENDING_PAYMENT' first.
+    status_text = "COD" if payment_method == "pay_cod" else "PENDING_PAYMENT"
+
+    # 3. PREPARE PAYLOAD
+    order_payload = {
+        "phone": phone,
+        "item_name": data.get("name", "Unknown Item"),
+        "qty": int(data.get("qty", 1)),
+        "total": total_amount,
+        "payment_method": "COD" if payment_method == "pay_cod" else "ONLINE",
+        "shop_id": shop_id,
+        "address": full_addr_str,
+        "pincode": addr['pincode'],
+        "city": addr['city'],
+        "state": addr['state'],
+        "status": status_text
+    }
+
+    # 4. SAVE TO DB
+    order_id = await save_order_to_db(order_payload)
+    
+    if not order_id:
+        await send_whatsapp_message(phone, "❌ Database Error. Please retry.")
+        return
+
+    # 5. ROUTING LOGIC (The Brain 🧠)
+
+    # --- CASE A: CASH ON DELIVERY ---
+    if payment_method == "pay_cod":
+        msg = (
+            f"🎉 *Order Placed Successfully!* 🎉\n"
+            f"🆔 Order #{order_id}\n"
+            f"📦 Item: {order_payload['item_name']} (x{order_payload['qty']})\n"
+            f"💰 Total: ₹{total_amount}\n"
+            f"📍 Ship To: {order_payload['city']}\n\n"
+            "We will update you when it ships! 🚚"
+        )
+        await send_whatsapp_message(phone, msg)
+        await state_manager.clear_state(phone)
+        
+        # Trigger Upsell if enabled
+        # await trigger_upsell_flow(phone, shop_id, order_id) 
+        return
+
+    # --- CASE B: ONLINE PAYMENT ---
+    elif payment_method == "pay_online":
+        
+        # LOGIC: Can we use Razorpay?
+        # Must be PRO plan + Razorpay Selected + Keys Exist
+        use_razorpay = (
+            (shop['plan_type'] == 'pro') and 
+            (shop['active_payment_method'] == 'razorpay') and 
+            shop['razorpay_key_id'] and 
+            shop['razorpay_key_secret']
+        )
+
+        # SUB-CASE B1: RAZORPAY AUTOMATION 🤖
+        if use_razorpay:
+            try:
+                import razorpay
+                rzp = razorpay.Client(auth=(shop['razorpay_key_id'], shop['razorpay_key_secret']))
+                
+                link_data = {
+                    "amount": int(total_amount * 100), # Paise
+                    "currency": "INR",
+                    "description": f"Order #{order_id}",
+                    "customer": {"contact": phone},
+                    "notify": {"sms": True, "email": False},
+                    "callback_url": "https://copit.in/payment-success", # Optional
+                    "callback_method": "get"
+                }
+                
+                payment_link = rzp.payment_link.create(link_data)
+                short_url = payment_link['short_url']
+                
+                msg = (
+                    f"💳 *Complete Your Payment*\n"
+                    f"🆔 Order #{order_id}\n"
+                    f"💰 Amount: ₹{total_amount}\n\n"
+                    f"👇 *Tap to Pay Securely:*\n{short_url}\n\n"
+                    f"_(Order confirms automatically after payment)_"
+                )
+                await send_whatsapp_message(phone, msg)
+                
+                # Save Link ID to State (for verification later if needed)
+                await state_manager.update_state(phone, {"payment_link_id": payment_link['id']})
+                return
+
+            except Exception as e:
+                print(f"🔥 Razorpay Failed: {e}")
+                # Fallback to UPI if Razorpay crashes
+        
+        # SUB-CASE B2: MANUAL UPI (The Fallback) 🏦
+        if shop['upi_id']:
+            # Replace with your actual base URL
+            base_url = "https://copit.in" 
+            pay_url = f"{base_url}/pay/manual?shop={shop_id}&amount={total_amount}&order={order_id}"
+            
+            msg = (
+                f"🏦 *Direct Payment Link*\n"
+                f"Amount: ₹{total_amount}\n\n"
+                f"👇 *Tap to Pay via UPI:*\n{pay_url}\n\n"
+                f"⚠️ *Important:* After paying, please send a *Screenshot* here to confirm."
+            )
+            
+            # Update state to wait for screenshot
+            await state_manager.set_state(phone, {
+                "state": "awaiting_screenshot", 
+                "order_id": order_id,
+                "shop_id": shop_id
+            })
+            await send_whatsapp_message(phone, msg)
+        else:
+            await send_whatsapp_message(phone, "❌ Seller has not set up payments. Please choose COD.")
+
+
+async def save_order_to_db(data):
+    """
+    Inserts data using the Single-Item Schema.
+    """
+    async with db.pool.acquire() as conn:
+        query = """
+            INSERT INTO orders (
+                customer_phone, 
+                item_name, 
+                quantity, 
+                total_amount, 
+                payment_method, 
+                delivery_address, 
+                delivery_pincode, 
+                delivery_city, 
+                delivery_state,
+                shop_id,
+                status,
+                payment_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+            RETURNING id
+        """
+        
+        # Use .get() with defaults to avoid KeyErrors
+        order_id = await conn.fetchval(query,
+            data['phone'],
+            data['item_name'],
+            data['qty'],
+            data['total'],
+            data['payment_method'],
+            data['address'],
+            data['pincode'],
+            data['city'],
+            data['state'],
+            data['shop_id'],
+            data['status'] # Passed from finalize_order
+        )
+        return order_id
+
+
+
+
+
+# Initialize a logger (Standard practice for production apps)
+logger = logging.getLogger("drop_bot")
+
+async def schedule_image_deletion(order_id: int, delay_seconds: int = 1800):
+    """
+    Background Task: Removes sensitive payment screenshot references after a delay.
+    
+    Args:
+        order_id (int): The ID of the order to clean.
+        delay_seconds (int): How long to wait before deletion (Default: 30 mins).
+    """
+    try:
+        # 1. The Wait (Non-blocking)
+        # We allow the verify process time to happen.
+        await asyncio.sleep(delay_seconds)
+
+        # 2. The Cleanup
+        # We use the new 'db.pool' you set up.
+        async with db.pool.acquire() as conn:
+            # We set the screenshot_id to NULL to "forget" it.
+            result = await conn.execute(
+                "UPDATE orders SET screenshot_id = NULL WHERE id = $1", 
+                order_id
+            )
+
+        # 3. Professional Logging
+        # 'UPDATE 1' means 1 row was changed.
+        if result == "UPDATE 1":
+            logger.info(f"🧹 Storage Purged: Screenshot removed for Order #{order_id}")
+        else:
+            logger.info(f"⚠️ Storage Purged: Order #{order_id} was already clean or not found.")
+
+    except Exception as e:
+        # 🛡️ SAFETY NET: Background tasks usually fail silently. 
+        # This ensures you see the error in your server logs.
+        logger.error(f"🔥 cleanup_task_failed: Order #{order_id} - Error: {e}")
+
+
+
+# app/services/order_service.py
+
+# Ensure these imports exist at the top of your file:
+# from app.core.database import db
+# from app.utils.whatsapp import send_interactive_message, send_whatsapp_message
+# from app.utils.state_manager import state_manager
+
+async def handle_selection_drilldown(phone, text_or_id, current_data):
+    """
+    Handles navigation:
+    1. User selects a Category -> Show Products.
+    2. User selects a Product -> Show Details (Handoff).
+    """
+    selection_id = text_or_id.strip() # e.g., "CAT_ELECTRONICS" or "ITEM_55"
+
+    # --------------------------------------------------------
+    # SCENARIO A: User Selected a CATEGORY
+    # --------------------------------------------------------
+    if selection_id.startswith("CAT_"):
+        category_name = selection_id.replace("CAT_", "")
+        shop_id = current_data.get("shop_id")
+
+        async with db.pool.acquire() as conn:
+            # Fetch items in this category
+            items = await conn.fetch("""
+                SELECT id, name, price, description 
+                FROM items 
+                WHERE shop_id = $1 AND category = $2 AND stock_quantity > 0
+                LIMIT 10
+            """, shop_id, category_name)
+
+        if not items:
+            await send_whatsapp_message(phone, f"🚫 No items found in {category_name}.")
+            return
+
+        # Construct Product List
+        # (Note: Interactive Lists are complex, simplified here as buttons for <3 items, 
+        # or you can implement the full 'list' type payload helper)
+        if len(items) <= 3:
+            # Use Buttons for small lists
+            btns = [{"id": f"ITEM_{i['id']}", "title": i['name'][:20]} for i in items]
+            msg = f"📂 *{category_name}*\nSelect an item:"
+            await send_interactive_message(phone, msg, btns)
+        else:
+            # For 4+ items, usually you'd send a "List Message" (requires extra helper),
+            # OR just text with codes. Let's use a Text List for robustness/simplicity.
+            msg = f"📂 *{category_name}*\n\n"
+            for i in items:
+                msg += f"• *{i['name']}* (₹{i['price']})\n   👉 Type *buy_item_{i['id']}*\n\n"
+            
+            await send_whatsapp_message(phone, msg)
+        
+        return
+
+    # --------------------------------------------------------
+    # SCENARIO B: User Selected an ITEM (via Button or List)
+    # --------------------------------------------------------
+    if selection_id.startswith("ITEM_"):
+        try:
+            item_id = int(selection_id.replace("ITEM_", ""))
+            # Re-use your existing logic to show the product
+            # (Assuming handle_web_handoff is in this same file or imported)
+            await handle_web_handoff(phone, item_id)
+        except ValueError:
+            print(f"🔥 Error parsing Item ID: {selection_id}")
+            
+    # --------------------------------------------------------
+    # SCENARIO C: Unknown Selection
+    # --------------------------------------------------------
+    else:
+        # Fallback
+        pass
+
+====================
+FILE: .\app\services\payment_service.py
+====================
+
+
+import os
+from app.core.database import db
+from app.utils.whatsapp import send_whatsapp_message
+from app.utils.state_manager import state_manager
+from app.services.order_service import save_order_to_db, send_order_confirmation
+
+async def handle_payment_selection(phone, selection_id, current_data):
+    print(f"💰 Handling Payment Selection: {selection_id} for {phone}")
+    
+    shop_id = current_data.get("shop_id")
+    total_amount = current_data.get("total")
+    
+    # 1. Fetch Shop Credentials AND Status Columns
+    async with db.pool.acquire() as conn:
+        shop = await conn.fetchrow("""
+            SELECT id, name, phone_number, 
+                   plan_type, active_payment_method, 
+                   razorpay_key_id, razorpay_key_secret, upi_id 
+            FROM shops WHERE id = $1
+        """, shop_id)
+    
+    # --- OPTION A: CASH ON DELIVERY (COD) ---
+    if selection_id == "pay_cod":
+        if current_data.get("address"):
+             order_id = await save_order_to_db(phone, current_data, address=current_data["address"], status_text="COD")
+             await send_order_confirmation(phone, order_id, current_data, "Cash on Delivery")
+        else:
+             await state_manager.set_state(phone, {"payment_method": "COD", "state": "awaiting_address"})
+             send_whatsapp_message(phone, "📍 Please type your *Full Address* for delivery:")
+        return
+
+    # --- OPTION B: PAY ONLINE ---
+    elif selection_id == "pay_online":
+        
+        # 1. DECISION LOGIC: STRICT CHECKS
+        plan = (shop['plan_type'] or 'free').lower()
+        method = (shop['active_payment_method'] or 'upi').lower()
+        
+        can_use_razorpay = (
+            plan == 'pro' and               # Must be Pro
+            method == 'razorpay' and        # Must have selected Razorpay in settings
+            shop['razorpay_key_id'] and     # Must have Key ID
+            shop['razorpay_key_secret']     # Must have Key Secret
+        )
+
+        # 2. EXECUTE RAZORPAY FLOW
+        if can_use_razorpay:
+            try:
+                import razorpay
+                client = razorpay.Client(auth=(shop['razorpay_key_id'], shop['razorpay_key_secret']))
+                
+                link_data = {
+                    "amount": int(total_amount * 100), 
+                    "currency": "INR",
+                    "description": f"Order from {shop['name']}",
+                    "customer": {"contact": phone, "name": "Valued Customer"},
+                    "notify": {"sms": True, "email": False},
+                    "callback_url": "https://your-domain.com/payment-success", 
+                    "callback_method": "get"
+                }
+                
+                payment_link = client.payment_link.create(link_data)
+                short_url = payment_link['short_url']
+                
+                await state_manager.set_state(phone, {"payment_link_id": payment_link['id']})
+
+                msg = (
+                    f"💳 *Secure Payment Link*\n"
+                    f"Amount: ₹{total_amount}\n\n"
+                    f"👇 *Tap to pay securely via Card/UPI:*\n{short_url}\n\n"
+                    f"⏳ *Order confirms automatically after payment!*"
+                )
+                send_whatsapp_message(phone, msg)
+                
+            except Exception as e:
+                print(f"🔥 Razorpay Error: {e}")
+                # Fallback to UPI if Razorpay crashes? Or just show error?
+                send_whatsapp_message(phone, "❌ Payment Gateway Error. Please try COD.")
+
+        # 3. EXECUTE UPI FLOW (For Free users OR Pro users who chose UPI)
+        elif shop['upi_id']:
+            base_url = "BASE_URL"  
+            pay_url = f"{base_url}/pay/manual?shop={shop_id}&amount={total_amount}"
+            
+            msg = (
+                f"🏦 *Direct Payment Link*\n"
+                f"Amount: ₹{total_amount}\n\n"
+                f"👇 *Tap to open GPay/PhonePe directly:*\n"
+                f"{pay_url}\n\n"
+                f"⚠️ *Important:* After paying, come back here and *send a screenshot*."
+            )
+            
+            await state_manager.set_state(phone, {"state": "awaiting_screenshot"})
+            send_whatsapp_message(phone, msg)
+            
+        else:
+            send_whatsapp_message(phone, "❌ This shop accepts COD only right now. Please select COD.")
+
+
+
+====================
+FILE: .\app\services\recovery_service.py
+====================
+
+import asyncio
+from app.utils.state_manager import state_manager
+from app.utils.whatsapp import send_interactive_message
+
+async def cart_recovery_loop():
+    print("🕵️ Cart Recovery Engine Started...")
+    while True:
+        try:
+            # 1. Find users silent for 30 minutes
+            stale_users = await state_manager.get_stale_carts(minutes=30)
+            
+            for phone, data in stale_users:
+                print(f"⏰ Nudging abandoned cart: {phone}")
+                
+                # 2. Extract Data
+                cart = data.get("cart", [])
+                item_count = len(cart)
+                total_val = data.get("total", 0)
+                
+                # Fallback calculation
+                if total_val == 0:
+                     total_val = sum(item['price'] * item['qty'] for item in cart)
+
+                msg = (
+                    f"👋 *You forgot something!* (Value: ₹{total_val})\n\n"
+                    f"Your *{item_count} items* are reserved, but stock is low! 🏃\n\n"
+                    f"🎁 *Special Offer:* Complete your order in the next 10 mins and get *5% OFF*.\n"
+                    f"👇 Use Code: *COMEBACK5*"
+                )
+                
+                # 3. INTERACTIVE BUTTONS
+                buttons = [
+                    {"id": "recover_checkout", "title": "Resume Checkout"},
+                    {"id": "recover_cancel", "title": "Empty Cart"}
+                ]
+                
+                send_interactive_message(phone, msg, buttons)
+                
+                # 4. Mark as nudged
+                await state_manager.update_state(phone, {"nudged": True})
+            
+            # Sleep for 60 seconds before next scan
+            await asyncio.sleep(60)
+            
+        except Exception as e:
+            print(f"🔥 Recovery Loop Error: {e}")
+            await asyncio.sleep(60)
+
+====================
+FILE: .\app\services\shop_service.py
+====================
+
+from app.core.database import db
+
+async def get_seller_phone(shop_id):
+    """
+    Fetches the seller's phone number to notify them of an upsell.
+    """
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT phone_number FROM shops WHERE id = $1", shop_id)
+        return row['phone_number'] if row else None
+    
+
+async def get_seller_info(shop_id):
+    async with db.pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, name, phone_number, upi_id, plan_type FROM shops WHERE id = $1", 
+            shop_id
+        )
+
+====================
+FILE: .\app\utils\shiprocket.py
+====================
+
+import json
+import requests
+from datetime import datetime
+
+# 1. LOGIN (Standard)
+def get_shiprocket_token(email, password):
+    url = "https://apiv2.shiprocket.in/v1/external/auth/login"
+    try:
+        response = requests.post(url, json={"email": email, "password": password})
+        if response.status_code == 200:
+            return response.json().get('token')
+        print(f"❌ Shiprocket Login Failed: {response.text}")
+        return None
+    except Exception as e:
+        print(f"❌ Network Error: {e}")
+        return None
+
+# 2. CREATE ORDER (The "Smart" Version)
+def create_shiprocket_order(token, order_data):
+    url = "https://apiv2.shiprocket.in/v1/external/orders/create/ad-hoc"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    
+    # A. ITEM PARSING & WEIGHT CALCULATION
+    items_payload = []
+    total_weight = 0.0
+    
+    # Handle if items are JSON string or List
+    raw_items = order_data['items']
+    if isinstance(raw_items, str):
+        raw_items = json.loads(raw_items)
+    
+    for item in raw_items:
+        qty = int(item.get('qty', 1))
+        # Default to 0.5kg per item if weight is missing in DB
+        w = float(item.get('weight', 0.5)) 
+        total_weight += w * qty
+
+        items_payload.append({
+            "name": item['name'],
+            "sku": item.get('sku', item['name'][:10]), 
+            "units": qty,
+            "selling_price": float(item['price']),
+            "discount": "",
+            "tax": "",
+            "hsn": "" # Add HSN to your DB items table for GST compliance
+        })
+
+    # B. ADDRESS MAPPING (Crucial Fixes)
+   
+    pincode = order_data.get('delivery_pincode') or order_data.get('pincode')
+    city = order_data.get('delivery_city') or order_data.get('city')
+    state = order_data.get('delivery_state') or order_data.get('state')
+    address_line = order_data.get('delivery_address') or order_data.get('address')
+
+    # C. FAIL-SAFE: If pincode is missing, we cannot ship.
+    if not pincode or len(str(pincode)) != 6:
+        return {"error": "Invalid Pincode. Cannot Ship."}
+
+    # D. PAYLOAD CONSTRUCTION
+    payload = {
+        "order_id": str(order_data['id']),
+        "order_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        
+        # ⚠️ Pickups fail if this name doesn't match the Seller's Dashboard EXACTLY
+        "pickup_location": order_data.get('pickup_location_name', "Primary"),
+        
+        # Customer Details
+        "billing_customer_name": order_data.get('customer_name', "Valued Customer"),
+        "billing_last_name": "",
+        "billing_address": address_line,
+        "billing_city": city,        # ✅ Dynamic
+        "billing_pincode": pincode,  # ✅ Dynamic
+        "billing_state": state,      # ✅ Dynamic
+        "billing_country": "India",
+        "billing_email": order_data.get('customer_email', "noreply@copit.in"),
+        "billing_phone": str(order_data['customer_phone']).replace("+91", "").strip(),
+        
+        "shipping_is_billing": True,
+        "order_items": items_payload,
+        "payment_method": "Prepaid" if order_data.get('status') == 'PAID' else "COD",
+        "sub_total": float(order_data['total_amount']),
+        "length": 10, "breadth": 10, "height": 10, 
+        "weight": total_weight # ✅ Dynamic
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        return response.json()
+    except Exception as e:
+        return {"message": f"API Error: {str(e)}"}
+
+# 3. GENERATE LABEL
+def generate_shipping_label(token, shipment_id):
+    url = "https://apiv2.shiprocket.in/v1/external/courier/generate/awb"
+    headers = {'Authorization': f'Bearer {token}'}
+    payload = {"shipment_id": [shipment_id]}
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        return response.json()
+    except Exception as e:
+        return None
+
+# 4. TRACK STATUS
+def check_shiprocket_status(token, shipment_id):
+    url = f"https://apiv2.shiprocket.in/v1/external/courier/track/shipment/{shipment_id}"
+    headers = {'Authorization': f'Bearer {token}'}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        
+      
+        if isinstance(data, dict):
+         
+             track_data = data.get('0', {}).get('tracking_data') or data.get('tracking_data')
+             
+             if track_data and 'shipment_track' in track_data:
+                 return track_data['shipment_track'][0]['current_status'].upper()
+                 
+        return "UNKNOWN"
+    except Exception as e:
+        print(f"Tracking Error: {e}")
+        return None
+
+====================
+FILE: .\app\utils\state_manager.py
+====================
+
+from datetime import datetime, timedelta
+
+
+class StateManager:
+    def __init__(self):
+        # 🧠 RAM Storage with Time Tracking
+        self.store = {}
+
+    async def get_state(self, phone):
+        return self.store.get(phone, {})
+
+    async def set_state(self, phone, data):
+        # Inject timestamp if not present
+        if "last_updated" not in data:
+            data["last_updated"] = datetime.now()
+        self.store[phone] = data
+
+    async def update_state(self, phone, new_data):
+        current = self.store.get(phone, {})
+        if not isinstance(current, dict):
+            current = {}
+        
+        # Merge Data
+        current.update(new_data)
+        
+        # 🕒 UPDATE TIMESTAMP (Critical for Recovery Loop)
+        current["last_updated"] = datetime.now()
+        
+        self.store[phone] = current
+
+    async def clear_state(self, phone):
+        if phone in self.store:
+            del self.store[phone]
+
+    async def get_stale_carts(self, minutes=30):
+        """
+        Retrieves users who have abandoned a valuable cart.
+        Logic: Active Cart + Stuck in Checkout + Silent for X mins + Not Nudged yet.
+        """
+        stale_users = []
+        now = datetime.now()
+        min_threshold = timedelta(minutes=minutes)
+        max_threshold = timedelta(hours=24) # Don't spam after 24 hours
+
+        snapshot = list(self.store.items()) 
+
+        for phone, data in snapshot:
+            # 1. BASIC CHECKS (Must have cart, must be stuck, must not be nudged)
+            if (data.get("cart") 
+                and data.get("state") in ["awaiting_payment_method", "awaiting_address", "awaiting_screenshot", "awaiting_qty"]
+                and not data.get("nudged")):
+                
+                last_active = data.get("last_updated") # Standardize key name
+                
+                # 2. TIMESTAMP PARSING (Handle both String and Datetime objects)
+                if isinstance(last_active, str):
+                    try:
+                        last_active = datetime.fromisoformat(last_active)
+                    except ValueError:
+                        continue # Skip bad data
+                
+                if not isinstance(last_active, datetime):
+                    continue # Skip missing timestamp
+
+                # 3. TIME CALCULATION
+                time_diff = now - last_active
+                
+                # If they are in the "Sweet Spot" (Silent for 30m, but less than 24h)
+                if time_diff > min_threshold and time_diff < max_threshold:
+                    stale_users.append(phone)
+                        
+        return stale_users
+    
+state_manager = StateManager()
+
+
+
+====================
+FILE: .\app\utils\whatsapp.py
+====================
+
+import httpx
+from app.core.config import WHATSAPP_TOKEN, PHONE_NUMBER_ID
+
+# --- HELPER: CENTRALIZED SENDER ---
+async def _send_to_meta(payload):
+    """
+    Internal helper to handle the actual HTTP request to Meta.
+    Prevents code duplication across functions.
+    """
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print("🔥 ERROR: Missing WhatsApp Credentials in Config!")
+        return None
+
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            
+            # 🛑 LOGIC: 400+ Errors mean Meta rejected it
+            if response.status_code >= 400:
+                print(f"🔥 Facebook API Error ({response.status_code}): {response.text}")
+                return None
+                
+            return response.json()
+        except Exception as e:
+            print(f"🔥 Connection Error: {e}")
+            return None
+
+# --- PUBLIC FUNCTIONS ---
+
+async def send_whatsapp_message(phone, text):
+    """
+    Sends a simple text message.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "text",
+        "text": {"body": text}
+    }
+    await _send_to_meta(payload)
+
+
+async def send_interactive_message(phone, body_text, buttons):
+    """
+    Sends a message with up to 3 buttons.
+    """
+    button_payloads = [
+        {"type": "reply", "reply": {"id": btn["id"], "title": btn["title"]}} 
+        for btn in buttons
+    ]
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text},
+            "action": {"buttons": button_payloads}
+        }
+    }
+    await _send_to_meta(payload)
+
+
+async def send_image_message(phone, image_url, caption=None):
+    """
+    Sends an image with an optional caption.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "image",
+        "image": {"link": image_url}
+    }
+    
+    if caption:
+        payload["image"]["caption"] = caption
+
+    await _send_to_meta(payload)
+
+
+async def send_marketing_template(phone, image_url, offer_text):
+    """
+    Sends a marketing template (requires 'custom_promo' approved in Meta).
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": "custom_promo", 
+            "language": {"code": "en"},
+            "components": [
+                {
+                    "type": "header",
+                    "parameters": [{"type": "image", "image": {"link": image_url}}]
+                },
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": offer_text}]
+                }
+            ]
+        }
+    }
+    await _send_to_meta(payload)
+
+
+async def send_delivery_template(phone, order_id):
+    """
+    Sends the 3-button review template (requires 'delivery_feedback_v3' approved).
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": "delivery_feedback_v3",
+            "language": {"code": "en"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": str(order_id)}]
+                }
+            ]
+        }
+    }
+    await _send_to_meta(payload)
+
+
+async def send_custom_payload(phone, payload):
+    """
+    Sends raw JSON payload (Used for special Flows or complicated messages).
+    """
+    # Just forward the payload to the helper, ensuring the 'to' field is set if missing
+    if "to" not in payload:
+        payload["to"] = phone
+        
+    await _send_to_meta(payload)

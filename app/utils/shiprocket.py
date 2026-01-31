@@ -122,3 +122,45 @@ def check_shiprocket_status(token, shipment_id):
     except Exception as e:
         print(f"Tracking Error: {e}")
         return None
+
+
+
+def check_serviceability(token, pickup_pincode, delivery_pincode, weight, cod=True):
+    url = "https://apiv2.shiprocket.in/v1/external/courier/serviceability/"
+    headers = {'Authorization': f'Bearer {token}'}
+    
+    # Shiprocket requires these parameters to give an accurate answer
+    params = {
+        "pickup_postcode": pickup_pincode,
+        "delivery_postcode": delivery_pincode,
+        "weight": weight,
+        "cod": 1 if cod else 0
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        data = response.json()
+        
+        # Check if the API call was successful
+        if data.get('status') == 200:
+            # "data['data']['available_courier_companies']" is a list of couriers.
+            # If this list is not empty, it means DELIVERY IS POSSIBLE.
+            couriers = data.get('data', {}).get('available_courier_companies', [])
+            
+            if couriers:
+                # Get the best courier details (usually the first one or one with high rating)
+                best_courier = couriers[0]
+                return {
+                    "status": "available",
+                    "cod_available": best_courier.get('cod') == 1,
+                    "etd": best_courier.get('etd'), # Estimated Time of Delivery (Date)
+                    "message": "Delivery available!"
+                }
+            else:
+                return {"status": "unavailable", "message": "No couriers available for this route."}
+        else:
+            return {"status": "error", "message": "Invalid Pincode."}
+            
+    except Exception as e:
+        print(f"Serviceability Error: {e}")
+        return {"status": "error", "message": "Could not check serviceability."}

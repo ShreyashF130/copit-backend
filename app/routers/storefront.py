@@ -1,5 +1,8 @@
 from fastapi import APIRouter
 from app.core.database import db
+from fastapi import APIRouter, Query
+from app.core.database import db
+from app.utils.shiprocket import get_shiprocket_token, check_serviceability
 
 router = APIRouter()
 
@@ -74,3 +77,35 @@ async def get_reviews(shop_id: int):
         "reviews": [dict(r) for r in rows],
         "stats": dict(stats)
     }
+
+
+
+
+@router.get("/check-pincode")
+async def check_pincode(shop_id: int, pincode: str):
+    async with db.pool.acquire() as conn:
+        # 1. Get Shop Credentials & Pickup Pincode
+        # (Note: You need to store the Seller's Pickup Pincode in the 'shops' table for this to work accurately)
+        # For now, we assume you might have added 'pickup_pincode' to shops table, or we use a default.
+        shop = await conn.fetchrow("""
+            SELECT shiprocket_email, shiprocket_password, pickup_address 
+            FROM shops WHERE id = $1
+        """, shop_id)
+        
+        if not shop or not shop['shiprocket_email']:
+            return {"status": "error", "message": "Seller shipping not configured."}
+
+        # 2. Authenticate
+        token = get_shiprocket_token(shop['shiprocket_email'], shop['shiprocket_password'])
+        if not token:
+            return {"status": "error", "message": "Service unavailable."}
+            
+        # 3. Check Serviceability
+        # We assume a default pickup pincode if not in DB, e.g., '400050' (Mumbai). 
+        # Ideally, fetch this from the shop's saved pickup address details in Shiprocket or DB.
+        # Let's assume you add a column 'pickup_pincode' to your shops table later.
+        seller_pincode = "400001" # REPLACE THIS with actual seller pincode logic
+        
+        result = check_serviceability(token, seller_pincode, pincode, weight=0.5, cod=True)
+        
+        return result
