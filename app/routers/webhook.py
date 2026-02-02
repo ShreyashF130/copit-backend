@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request, HTTPException
 import re
 import logging
 
+import os
 # 1. CORE & UTILS
 from app.core.database import db
 from app.utils.state_manager import state_manager
@@ -326,7 +327,7 @@ async def verify_webhook(request: Request):
 
     # 2. Check if token matches YOUR secret (Define this in Meta Dashboard)
     # RUTHLESS NOTE: Replace 'dropbot_secure_123' with whatever you typed in Meta.
-    MY_VERIFY_TOKEN = "dropbot_secure_123" 
+    MY_VERIFY_TOKEN = os.getenv("VERIFY_TOKEN") 
 
     if mode == "subscribe" and token == MY_VERIFY_TOKEN:
         print("✅ Webhook Verified!")
