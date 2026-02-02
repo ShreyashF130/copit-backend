@@ -1,14 +1,17 @@
 from fastapi import APIRouter, Request, HTTPException
 import re
 import logging
+import json
 
 # 1. CORE & UTILS
 from app.core.database import db
 from app.utils.state_manager import state_manager
-from app.utils.whatsapp import  send_whatsapp_message, send_interactive_message
+from app.utils.whatsapp import  send_whatsapp_message, send_interactive_message ,send_address_flow
 
 # 2. SERVICES (The Business Logic)
 from app.services.shop_service import get_seller_phone
+from app.utils.shiprocket import check_serviceability
+
 
 
 from app.services.order_service import (
@@ -23,6 +26,7 @@ from app.services.order_service import (
 # Initialize Router
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
 
 @router.post("/webhook")
 async def receive_message(request: Request):
@@ -50,16 +54,41 @@ async def receive_message(request: Request):
         state = current_data.get("state")
 
         # ============================================================
-        # A. INTERACTIVE MESSAGES (Button Clicks)
+        # A. INTERACTIVE MESSAGES (Button Clicks & FLOW REPLIES)
         # ============================================================
         if msg_type == "interactive":
             interactive = msg["interactive"]
-            selection_id = interactive["button_reply"]["id"]
-
-            # --- 1. ADDRESS CONFIRMATION ---
-            if selection_id.startswith("CONFIRM_ADDR_"):
+            
+            # 👇 [NEW] 1. HANDLE FLOW DATA SUBMISSION (The Capture)
+            if interactive["type"] == "nfm_reply":
                 try:
-                    addr_id = int(selection_id.split("_")[-1])
+                    # A. Parse the JSON sent back by WhatsApp
+                    reply_json = json.loads(interactive["nfm_reply"]["response_json"])
+                    
+                    # B. Extract Data
+                    pincode = reply_json.get("pincode")
+                    house_no = reply_json.get("house_no")
+                    area = reply_json.get("area")
+                    city = reply_json.get("city")
+                    
+                    # C. INDUSTRIAL VALIDATION (Trust No One)
+                    if not pincode or len(str(pincode)) != 6:
+                        await send_whatsapp_message(phone, "❌ Invalid Pincode. Please enter a 6-digit code.")
+                        return {"status": "ok"}
+
+                    # D. SAVE TO DATABASE
+                    async with db.pool.acquire() as conn:
+                        # Ensure user exists first
+                        await conn.execute("INSERT INTO users (phone_number) VALUES ($1) ON CONFLICT DO NOTHING", phone)
+                        
+                        # Insert Address
+                        addr_id = await conn.fetchval("""
+                            INSERT INTO addresses (user_id, pincode, house_no, area, city, is_default, created_at)
+                            VALUES ($1, $2, $3, $4, $5, TRUE, NOW())
+                            RETURNING id
+                        """, phone, pincode, house_no, area, city)
+
+                    # E. UPDATE STATE & MOVE TO PAYMENT
                     await state_manager.update_state(phone, {"address_id": addr_id})
                     
                     total = current_data.get("total", 0)
@@ -67,62 +96,69 @@ async def receive_message(request: Request):
                         {"id": "pay_online", "title": "Pay Online"}, 
                         {"id": "pay_cod", "title": "Cash on Delivery"}
                     ]
-                    await send_interactive_message(phone, f"✅ Address Confirmed!\n💰 *Total: ₹{total}*\nSelect Payment Method:", btns)
-                except ValueError:
-                    logger.error(f"Invalid Address ID: {selection_id}")
+                    await send_interactive_message(phone, f"✅ Address Saved!\n💰 *Total: ₹{total}*\nSelect Payment Method:", btns)
+                    
+                except Exception as e:
+                    logger.error(f"🔥 Flow Data Error: {e}", exc_info=True)
+                    await send_whatsapp_message(phone, "❌ Error saving address. Please try again.")
+                
                 return {"status": "ok"}
 
-            # --- 2. CHANGE ADDRESS ---
+            # 👇 2. HANDLE STANDARD BUTTON CLICKS
+            # (We only check button_reply if it's NOT a flow reply)
+            if interactive["type"] == "button_reply":
+                selection_id = interactive["button_reply"]["id"]
 
-            if selection_id == "CHANGE_ADDR":
-                # 1. Generate a Random Token
-                import uuid
-                token = str(uuid.uuid4())
-                
-                # 2. Save it to DB (Link this token to the user's phone)
-                async with db.pool.acquire() as conn:
-                    await conn.execute("""
-                        INSERT INTO users (phone_number, magic_token) 
-                        VALUES ($1, $2)
-                        ON CONFLICT (phone_number) 
-                        DO UPDATE SET magic_token = $2
-                    """, phone, token)
+                # --- ADDRESS CONFIRMATION (Old Address) ---
+                if selection_id.startswith("CONFIRM_ADDR_"):
+                    try:
+                        addr_id = int(selection_id.split("_")[-1])
+                        await state_manager.update_state(phone, {"address_id": addr_id})
+                        
+                        total = current_data.get("total", 0)
+                        btns = [
+                            {"id": "pay_online", "title": "Pay Online"}, 
+                            {"id": "pay_cod", "title": "Cash on Delivery"}
+                        ]
+                        await send_interactive_message(phone, f"✅ Address Confirmed!\n💰 *Total: ₹{total}*\nSelect Payment Method:", btns)
+                    except ValueError:
+                        logger.error(f"Invalid Address ID: {selection_id}")
+                    return {"status": "ok"}
 
-                # 3. Send Link with Token (Phone number is HIDDEN)
-                web_link = f"https://copit.in/fill-address?token={token}"
-                
-                msg = f"✏️ *Update Address*\nClick here securely: {web_link}"
-                await send_whatsapp_message(phone, msg)
-                return {"status": "ok"}
+                # --- [UPDATED] CHANGE ADDRESS (Trigger Flow) ---
+                if selection_id == "CHANGE_ADDR":
+                    # 🚀 RUTHLESS UPDATE: No more web links. Call the Flow.
+                    await send_address_flow(phone)
+                    return {"status": "ok"}
 
-            # --- 3. PAYMENT SELECTION ---
-            if selection_id in ["pay_online", "pay_cod"]:
-                await state_manager.update_state(phone, {"payment_method": selection_id})
-                
-                raw_addr_id = current_data.get("address_id")
-                
-                # Logic: If address ID missing, force address flow
-                if not raw_addr_id:
+                # --- PAYMENT SELECTION ---
+                if selection_id in ["pay_online", "pay_cod"]:
+                    await state_manager.update_state(phone, {"payment_method": selection_id})
+                    
+                    raw_addr_id = current_data.get("address_id")
+                    
+                    # Logic: If address ID missing, force address flow
+                    if not raw_addr_id:
+                        await check_address_before_payment(phone)
+                        return {"status": "ok"}
+
+                    try:
+                        addr_id = int(raw_addr_id)
+                        await finalize_order(phone, current_data, addr_id)
+                    except (ValueError, TypeError):
+                        await check_address_before_payment(phone)
+                    
+                    return {"status": "ok"}
+
+                # --- CART RECOVERY ---
+                if selection_id == "recover_checkout":
                     await check_address_before_payment(phone)
                     return {"status": "ok"}
 
-                try:
-                    addr_id = int(raw_addr_id)
-                    await finalize_order(phone, current_data, addr_id)
-                except (ValueError, TypeError):
-                    await check_address_before_payment(phone)
-                
-                return {"status": "ok"}
-
-            # --- 4. CART RECOVERY ---
-            if selection_id == "recover_checkout":
-                await check_address_before_payment(phone)
-                return {"status": "ok"}
-
-            if selection_id == "recover_cancel":
-                await state_manager.clear_state(phone)
-                await send_whatsapp_message(phone, "❌ Cart cleared.")
-                return {"status": "ok"}
+                if selection_id == "recover_cancel":
+                    await state_manager.clear_state(phone)
+                    await send_whatsapp_message(phone, "❌ Cart cleared.")
+                    return {"status": "ok"}
 
             return {"status": "ok"}
         
@@ -148,12 +184,7 @@ async def receive_message(request: Request):
                     await handle_web_handoff(phone, item_id) 
                 return {"status": "ok"}
             
-            # --- 3. WEBSITE RETURN ---
-            if text == "ADDRESS_DONE":
-                await check_address_before_payment(phone)
-                return {"status": "ok"}
-
-            # --- 4. REVIEWS ---
+            # --- 3. REVIEWS ---
             if text == "4-5 Stars":
                 await state_manager.update_state(phone, {
                     "rating": 5, 
@@ -163,7 +194,7 @@ async def receive_message(request: Request):
                 await send_whatsapp_message(phone, "❤️ Thank you! Could you write a short review for our website?")
                 return {"status": "ok"}
 
-            # --- 5. STATE: MANUAL ADDRESS INPUT ---
+            # --- 4. STATE: MANUAL ADDRESS INPUT (Fallback) ---
             if state == "awaiting_manual_address":
                 parts = [p.strip() for p in text.split(",")]
                 if len(parts) >= 2:
@@ -185,7 +216,7 @@ async def receive_message(request: Request):
                     await send_whatsapp_message(phone, "⚠️ Format: *Pincode, House No, City*")
                 return {"status": "ok"}
 
-            # --- 6. STATE: UPSELL DECISION ---
+            # --- 5. STATE: UPSELL DECISION ---
             elif state == "awaiting_upsell_decision":
                 user_reply = text.strip().lower()
                 if user_reply in ["yes", "add", "ok", "y", "1"]:
@@ -225,12 +256,12 @@ async def receive_message(request: Request):
                 await state_manager.clear_state(phone)
                 return {"status": "ok"}
 
-            # --- 7. STATE: DRILLDOWN (Category/Product Selection) ---
+            # --- 6. STATE: DRILLDOWN (Category/Product Selection) ---
             elif state == "awaiting_selection":
                 await handle_selection_drilldown(phone, text, current_data)
                 return {"status": "ok"}
 
-            # --- 8. STATE: QUANTITY & STOCK CHECK ---
+            # --- 7. STATE: QUANTITY & STOCK CHECK ---
             elif state == "awaiting_qty" and text.isdigit():
                 qty = int(text)
                 raw_item_id = current_data.get('item_id')

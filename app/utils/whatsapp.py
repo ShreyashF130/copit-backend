@@ -1,5 +1,9 @@
 import httpx
 from app.core.config import WHATSAPP_TOKEN, PHONE_NUMBER_ID
+import json
+import requests
+import os
+
 
 # --- HELPER: CENTRALIZED SENDER ---
 async def _send_to_meta(payload):
@@ -143,4 +147,45 @@ async def send_custom_payload(phone, payload):
     if "to" not in payload:
         payload["to"] = phone
         
+    await _send_to_meta(payload)
+
+ADDRESS_FLOW_ID = os.getenv("ADDRESS_FLOW_ID")
+async def send_address_flow(phone, flow_id=ADDRESS_FLOW_ID):
+    """
+    Sends the Native Address Form (WhatsApp Flow) to the user.
+    Draft mode is enabled for testing.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "flow",
+            "header": {
+                "type": "text",
+                "text": "⚡ Fast Checkout"
+            },
+            "body": {
+                "text": "Please fill your delivery details securely within WhatsApp."
+            },
+            "footer": {
+                "text": "Secure by CopIt"
+            },
+            "action": {
+                "name": "flow",
+                "parameters": {
+                    "flow_message_version": "3",
+                    "flow_token": "unused_token",
+                    "flow_id": flow_id,
+                    "flow_cta": "Fill Address",
+                    "flow_action": "navigate",
+                    "flow_action_payload": {
+                        "screen": "ADDRESS_SCREEN"
+                    },
+                    "mode": "draft"  # ⚠️ REMOVE THIS WHEN YOU GO LIVE
+                }
+            }
+        }
+    }
     await _send_to_meta(payload)

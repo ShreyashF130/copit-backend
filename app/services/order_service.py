@@ -1,4 +1,4 @@
-from app.utils.whatsapp import send_whatsapp_message, send_interactive_message,send_image_message
+from app.utils.whatsapp import send_whatsapp_message, send_interactive_message,send_image_message,send_address_flow
 from app.utils.state_manager import state_manager
 import uuid
 import json
@@ -6,6 +6,7 @@ import asyncio
 from app.core.database import db
 import asyncio
 import logging
+
 
 
 async def finalize_order(phone, data, addr_id):
@@ -196,8 +197,13 @@ async def save_order_to_db(data):
         return order_id
     
 async def check_address_before_payment(phone):
+    """
+    RUTHLESS LOGIC:
+    1. If Address Exists -> Show Confirm/Change Buttons.
+    2. If New User -> Trigger WhatsApp Flow immediately.
+    """
     async with db.pool.acquire() as conn:
-        # 1. Check for Existing Address
+        # 1. Check for Existing Address (Latest one)
         row = await conn.fetchrow("""
             SELECT id, full_address, pincode, city, house_no, area 
             FROM addresses 
@@ -206,7 +212,7 @@ async def check_address_before_payment(phone):
         """, phone)
 
         if row:
-            # [Existing Logic] Address Found -> Show Confirm Button
+            # ✅ SCENARIO A: Old User (Show Confirmation)
             addr_id = row['id']
             parts = [p for p in [row['house_no'], row['area'], row['city'], row['pincode']] if p]
             display_addr = ", ".join(parts) or row['full_address']
@@ -216,32 +222,14 @@ async def check_address_before_payment(phone):
                 {"id": f"CONFIRM_ADDR_{addr_id}", "title": "✅ Yes, Ship Here"},
                 {"id": "CHANGE_ADDR", "title": "✏️ Change Address"}
             ]
-            send_interactive_message(phone, msg, btns)
+            await send_interactive_message(phone, msg, btns)
         
         else:
-            # 🛡️ SECURITY FIX: Generate Magic Token
-            token = str(uuid.uuid4()) # Generates random string like 'f47ac10b-58cc...'
-            
-            # Save token to DB so we can verify it later
-            # We use UPSERT (Insert or Update) to ensure phone exists
-            await conn.execute("""
-                INSERT INTO users (phone_number, magic_token) 
-                VALUES ($1, $2)
-                ON CONFLICT (phone_number) 
-                DO UPDATE SET magic_token = $2
-            """, phone, token)
+            # 🚀 SCENARIO B: New User (Trigger Flow Instantly)
+            # No more web links. No more tokens.
+            await send_address_flow(phone)
 
-            # Generate Secure Link (NO PHONE NUMBER IN URL)
-            # Replace with your actual Vercel domain
-            web_link = f"https://your-site.vercel.app/mobile-address?token={token}"
             
-            msg = (
-                "🚚 *Shipping Details Needed*\n"
-                "To ensure safe delivery, please fill your address securely:\n\n"
-                f"🔗 *Click here:* {web_link}"
-            )
-            await send_whatsapp_message(phone, msg)
-
 
 async def handle_web_handoff(phone, item_id, referrer=None):
     async with db.pool.acquire() as conn:
