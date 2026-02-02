@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Request, HTTPException
 import re
 import logging
-import json
 
 # 1. CORE & UTILS
 from app.core.database import db
@@ -11,6 +10,7 @@ from app.utils.whatsapp import  send_whatsapp_message, send_interactive_message 
 # 2. SERVICES (The Business Logic)
 from app.services.shop_service import get_seller_phone
 from app.utils.shiprocket import check_serviceability
+from fastapi.responses import PlainTextResponse 
 
 
 
@@ -309,4 +309,29 @@ async def receive_message(request: Request):
     except Exception as e:
         logger.error(f"🔥 Webhook Error: {e}", exc_info=True)
         
-    return {"status": "ok"}
+    return {"status": "ok"}    
+
+
+
+
+@router.get("/webhook")
+async def verify_webhook(request: Request):
+    """
+    Handle Meta's verification challenge.
+    """
+    # 1. Get query parameters
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    # 2. Check if token matches YOUR secret (Define this in Meta Dashboard)
+    # RUTHLESS NOTE: Replace 'dropbot_secure_123' with whatever you typed in Meta.
+    MY_VERIFY_TOKEN = "dropbot_secure_123" 
+
+    if mode == "subscribe" and token == MY_VERIFY_TOKEN:
+        print("✅ Webhook Verified!")
+        # 3. Return the challenge as PLAIN TEXT (Not JSON)
+        return PlainTextResponse(content=challenge, status_code=200)
+    
+    # 4. If token is wrong, reject it.
+    raise HTTPException(status_code=403, detail="Verification failed")
