@@ -150,11 +150,16 @@ async def send_custom_payload(phone, payload):
     await _send_to_meta(payload)
 
 ADDRESS_FLOW_ID = os.getenv("ADDRESS_FLOW_ID")
+
 async def send_address_flow(phone, flow_id=ADDRESS_FLOW_ID):
     """
     Sends the Native Address Form (WhatsApp Flow) to the user.
     Draft mode is enabled for testing.
     """
+
+    # ... inside send_address_flow function ...
+    print(f"DEBUG: Sending Flow ID: {flow_id}") # <--- ADD THIS
+
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
