@@ -35,41 +35,38 @@ class StateManager:
     async def get_stale_carts(self, minutes=30):
         """
         Retrieves users who have abandoned a valuable cart.
-        Logic: Active Cart + Stuck in Checkout + Silent for X mins + Not Nudged yet.
+        Returns a list of tuples: [(phone, data), (phone, data)...]
         """
         stale_users = []
         now = datetime.now()
         min_threshold = timedelta(minutes=minutes)
-        max_threshold = timedelta(hours=24) # Don't spam after 24 hours
+        max_threshold = timedelta(hours=24) 
 
         snapshot = list(self.store.items()) 
 
         for phone, data in snapshot:
-            # 1. BASIC CHECKS (Must have cart, must be stuck, must not be nudged)
+            # 1. BASIC CHECKS
             if (data.get("cart") 
                 and data.get("state") in ["awaiting_payment_method", "awaiting_address", "awaiting_screenshot", "awaiting_qty"]
                 and not data.get("nudged")):
                 
-                last_active = data.get("last_updated") # Standardize key name
+                last_active = data.get("last_updated")
                 
-                # 2. TIMESTAMP PARSING (Handle both String and Datetime objects)
+                # 2. TIMESTAMP PARSING
                 if isinstance(last_active, str):
                     try:
                         last_active = datetime.fromisoformat(last_active)
                     except ValueError:
-                        continue # Skip bad data
+                        continue 
                 
                 if not isinstance(last_active, datetime):
-                    continue # Skip missing timestamp
+                    continue 
 
                 # 3. TIME CALCULATION
                 time_diff = now - last_active
                 
-                # If they are in the "Sweet Spot" (Silent for 30m, but less than 24h)
                 if time_diff > min_threshold and time_diff < max_threshold:
-                    stale_users.append(phone)
+                    # FIX IS HERE 👇
+                    stale_users.append((phone, data)) 
                         
         return stale_users
-    
-state_manager = StateManager()
-
