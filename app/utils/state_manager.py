@@ -70,3 +70,5 @@ class StateManager:
                     stale_users.append((phone, data)) 
                         
         return stale_users
+
+state_manager = StateManager()
