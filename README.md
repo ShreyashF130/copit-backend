@@ -63,18 +63,18 @@ The backend follows an **Event-Driven Architecture** centered around FastAPI web
 
 ```mermaid
 graph TD
-    User((User)) -->|Sends Message| WA[WhatsApp Cloud API]
-    WA -->|Webhook Payload| API[FastAPI Backend]
+    User((User)) -->|"Sends Message"| WA[WhatsApp Cloud API]
+    WA -->|"Webhook Payload"| API[FastAPI Backend]
     
     subgraph "CopIt Engine"
-        API -->|Check Session| DB[(Supabase/PostgreSQL)]
-        API -->|Validate Pincode| Ship[Shiprocket API]
-        API -->|Generate Link| Pay[Razorpay API]
+        API -->|"Check Session"| DB[("Supabase/PostgreSQL")]
+        API -->|"Validate Pincode"| Ship[Shiprocket API]
+        API -->|"Generate Link"| Pay[Razorpay API]
         
-        API -->|State Logic| Controller[State Manager]
+        API -->|"State Logic"| Controller[State Manager]
     end
     
-    Controller -->|Response| WA
-    User -->|Click Checkout Link| Web[Next.js Frontend]
-    Web -->|Fetch Data (UUID)| API
-    Web -->|Confirm Address| DB
+    Controller -->|"Response"| WA
+    User -->|"Click Checkout Link"| Web[Next.js Frontend]
+    Web -->|"Fetch Data (UUID)"| API
+    Web -->|"Confirm Address"| DB
