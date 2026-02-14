@@ -40,7 +40,9 @@ origins = [base_url] if base_url else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origins], 
+    allow_origins=["https://copit.in",           # Your Production Domain
+        "https://www.copit.in",       # With www
+        "http://localhost:3000"],# Local Dev 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
