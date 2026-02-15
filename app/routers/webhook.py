@@ -1,10 +1,13 @@
+from email import message
 from fastapi import APIRouter, Request, HTTPException
 import re
 import logging
+import json
 
 import os
 # 1. CORE & UTILS
 from app.core.database import db
+from app.routers.checkout import create_checkout_url
 from app.utils.state_manager import state_manager
 from app.utils.whatsapp import  send_whatsapp_message, send_interactive_message ,send_address_flow
 
@@ -129,8 +132,19 @@ async def receive_message(request: Request):
                 # --- [UPDATED] CHANGE ADDRESS (Trigger Flow) ---
                 if selection_id == "CHANGE_ADDR":
                     # 🚀 RUTHLESS UPDATE: No more web links. Call the Flow.
-                    await send_address_flow(phone)
-                    return {"status": "ok"}
+                    phone = message["from"]  # Extract sender phone
+                    checkout_link = create_checkout_url(phone)
+
+                    # B. Send the Reply
+                    response_text = (
+                        "Tap the link below to securely update your address:\n\n"
+                        f"🔗 {checkout_link}\n\n"
+                        "_This link expires in 24 hours._"
+                    )
+                    await send_whatsapp_message(phone, response_text)
+                    
+                    # STOP here. Do not process further.
+                    return {"status": "success"}
 
                 # --- PAYMENT SELECTION ---
                 if selection_id in ["pay_online", "pay_cod"]:

@@ -101,3 +101,44 @@ async def confirm_address(data: AddressSubmit):
     whatsapp_link = f"https://wa.me/91YOUR_BOT_NUMBER?text=Address_Confirmed_for_{data.session_id}"
     
     return {"redirect_url": whatsapp_link}
+
+
+
+# app/routers/checkout.py
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import uuid
+import json
+from datetime import datetime, timedelta
+from app.core.database import db
+
+router = APIRouter()
+
+# --- SHARED STATE ---
+checkout_sessions = {}
+
+# --- NEW SHARED FUNCTION (Copy this exact function) ---
+def create_checkout_url(phone: str) -> str:
+    """
+    Generates a session and returns the URL. 
+    Can be called by API OR Webhook.
+    """
+    session_id = str(uuid.uuid4())
+    checkout_sessions[session_id] = {
+        "phone": phone,
+        "expires_at": datetime.now() + timedelta(hours=24)
+    }
+    return f"https://copit.in/checkout/{session_id}"
+
+# --- API ENDPOINTS ---
+class CheckoutRequest(BaseModel):
+    phone: str
+
+@router.post("/generate-link")
+async def generate_checkout_link(request: CheckoutRequest):
+    # Now simply call the shared function
+    url = create_checkout_url(request.phone)
+    return {"url": url}
+
+# ... (Keep the rest of get_session_data and confirm_address exactly as they were) ...
