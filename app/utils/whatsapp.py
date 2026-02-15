@@ -187,8 +187,7 @@ async def send_address_flow(phone, flow_id=ADDRESS_FLOW_ID):
                     "flow_action": "navigate",
                     "flow_action_payload": {
                         "screen": "ADDRESS_SCREEN"
-                    },
-                    "mode": "draft"  # ⚠️ REMOVE THIS WHEN YOU GO LIVE
+                    }
                 }
             }
         }

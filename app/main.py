@@ -9,7 +9,7 @@ from app.core.database import db
 from app.services.recovery_service import cart_recovery_loop
 from app.services.delivery_service import delivery_watchdog_loop
 
-from app.routers import webhook, admin, payment, storefront
+from app.routers import checkout, webhook, admin, payment, storefront
 
 # 3. LIFESPAN (The On/Off Switch)
 @asynccontextmanager
@@ -53,6 +53,7 @@ app.include_router(webhook.router)
 app.include_router(admin.router, prefix="/api") 
 app.include_router(payment.router, prefix="/api")
 app.include_router(storefront.router, prefix="/api")
+app.include_router(checkout.router)
 
 @app.get("/")
 def health_check():
