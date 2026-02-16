@@ -352,6 +352,7 @@
 #     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import PlainTextResponse 
 import re
@@ -475,12 +476,13 @@ async def receive_message(request: Request):
                 # --- 🚀 [FIXED] CHANGE ADDRESS (Web Link Handoff) ---
                 if selection_id == "CHANGE_ADDR":
                     # Generate the Secure Link
+                    # NOTE: We MUST await this now because it writes to DB
                     checkout_link = await create_checkout_url(phone)
 
                     response_text = (
                         "Tap the link below to securely update your address:\n\n"
                         f"🔗 {checkout_link}\n\n"
-                        "_This link expires in 24 hours._"
+                        "_This link expires in 10 minutes._"
                     )
                     await send_whatsapp_message(phone, response_text)
                     
@@ -511,6 +513,27 @@ async def receive_message(request: Request):
         # ============================================================
         elif msg_type == "text":
             text = msg["text"]["body"].strip()
+
+            # --- 🚀 [NEW] HANDLE ADDRESS CONFIRMATION RETURN ---
+            # This triggers when the user clicks the link on your website and is sent back to WA
+            if "Address_Confirmed_for_" in text:
+                logger.info(f"✅ Received Address Confirmation from {phone}")
+                
+                # 1. Update State to 'address_confirmed'
+                total = current_data.get("total", 0)
+                
+                await state_manager.update_state(phone, {
+                    "address_confirmed": True,
+                    "state": "awaiting_payment_method"
+                })
+                
+                # 2. Show Payment Options IMMEDIATELY
+                btns = [
+                    {"id": "pay_online", "title": "Pay Online"}, 
+                    {"id": "pay_cod", "title": "Cash on Delivery"}
+                ]
+                await send_interactive_message(phone, f"✅ Address Updated Successfully!\n\n💰 *Total: ₹{total}*\nSelect Payment Method:", btns)
+                return {"status": "ok"}
 
             # --- 1. BULK ORDER ---
             if "buy_bulk_" in text:

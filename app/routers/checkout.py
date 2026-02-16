@@ -116,8 +116,10 @@ async def get_session_data(session_id: str):
         "saved_address": saved_address
     }
 
+
 @router.post("/confirm-address")
 async def confirm_address(data: AddressSubmit):
+    # 1. Validate Session
     clean_id = data.session_id.strip()
     search_pattern = f"{clean_id}::%"
 
@@ -131,22 +133,33 @@ async def confirm_address(data: AddressSubmit):
         if not row:
             raise HTTPException(status_code=400, detail="Invalid Session")
         
-        # Double Check Expiry
+        # Expiry Check
         _, expiry_str = row['magic_token'].split("::")
         if datetime.now(timezone.utc).timestamp() > float(expiry_str):
             raise HTTPException(status_code=400, detail="Link expired")
         
         phone = row['phone_number']
-        address_json = json.dumps(data.address)
+        addr = data.address # This is now the dictionary with pincode, house_no, etc.
 
-        # UPDATE & SELF DESTRUCT
+        # 2. INSERT INTO 'addresses' TABLE (Structured Data)
+        # We assume your 'addresses' table has user_id as foreign key to users(phone_number)
+        address_id = await conn.fetchval("""
+            INSERT INTO addresses 
+            (user_id, pincode, house_no, area, landmark, city, state, is_default)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+            RETURNING id
+        """, phone, addr.get("pincode"), addr.get("house_no"), addr.get("area"), 
+             addr.get("landmark"), addr.get("city"), addr.get("state"))
+
+        # 3. ALSO UPDATE 'users' JSON (For backward compatibility/caching)
+        # And KILL the token
         await conn.execute("""
             UPDATE users 
             SET saved_addresses = $2::jsonb, magic_token = NULL 
             WHERE phone_number = $1
-        """, phone, address_json)
+        """, phone, json.dumps(addr))
     
-    # Change this to your actual bot number/link
-    whatsapp_link = f"https://wa.me/{os.getenv('BOT_NUMBER')}?text=Address_Confirmed"
+    # 4. Return WhatsApp Link
+    whatsapp_link = f"https://wa.me/{os.getenv('BOT_NUMBER')}?text=Address_Confirmed_for_{clean_id}"
     
     return {"redirect_url": whatsapp_link}
