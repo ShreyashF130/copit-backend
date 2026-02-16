@@ -963,7 +963,6 @@
 
 
 
-
 import logging
 import json
 import asyncio
@@ -981,11 +980,11 @@ from app.utils.whatsapp import (
 logger = logging.getLogger("drop_bot")
 
 # ==============================================================================
-# 1. ENTRY POINT: ITEM HANDOFF
+# 1. ENTRY POINT: SINGLE ITEM HANDOFF
 # ==============================================================================
 async def handle_web_handoff(phone, item_id, referrer=None):
     """
-    Step 1: User selects an item. 
+    Step 1: User selects a SINGLE item. 
     We fetch details and ask for Quantity (or Variant).
     """
     async with db.pool.acquire() as conn:
@@ -1061,7 +1060,134 @@ async def handle_web_handoff(phone, item_id, referrer=None):
 
 
 # ==============================================================================
-# 2. CHECKPOINT: ADDRESS VERIFICATION
+# 2. ENTRY POINT: BULK ORDER HANDOFF (The Missing Piece Fix)
+# ==============================================================================
+async def handle_bulk_handoff(phone, ref_string):
+    """
+    Parses 'buy_bulk_26:2,27:1_COUPON:SALE20'
+    Fetches items, calculates totals, applies coupons, and sets state.
+    """
+    logger.info(f"Processing Bulk Order: {ref_string}")
+    
+    try:
+        # 1. Parse Coupon & Items
+        coupon_code = None
+        if "_COUPON:" in ref_string:
+            parts = ref_string.split("_COUPON:")
+            items_part = parts[0]
+            coupon_code = parts[1].strip()
+        else:
+            items_part = ref_string
+
+        # Clean string: remove prefix "buy_bulk_"
+        items_part = items_part.replace("buy_bulk_", "")
+        raw_items = items_part.split(",")
+        
+        cart_items = []
+        subtotal = 0
+        shop_id = None
+        seller_phone = None
+        summary_text = ""
+        hero_image_url = None 
+
+        async with db.pool.acquire() as conn:
+            for entry in raw_items:
+                if ":" not in entry: continue
+                try:
+                    item_id_str, qty_str = entry.split(":")
+                    item_id, qty = int(item_id_str), int(qty_str)
+                except ValueError:
+                    continue
+                
+                # Fetch Item
+                item = await conn.fetchrow("""
+                    SELECT i.name, i.price, i.image_url, i.shop_id, s.phone_number, s.name as shop_name
+                    FROM items i JOIN shops s ON i.shop_id = s.id 
+                    WHERE i.id = $1
+                """, item_id)
+                
+                if item:
+                    line_total = float(item['price']) * qty
+                    subtotal += line_total
+                    shop_id = item['shop_id'] # Assume all items from same shop or take last
+                    seller_phone = item['phone_number']
+                    
+                    # Capture first image as hero
+                    if not hero_image_url and item['image_url']:
+                        hero_image_url = item['image_url']
+                    
+                    cart_items.append({
+                        "item_id": item_id, # Store ID for later usage
+                        "name": item['name'],
+                        "qty": qty,
+                        "price": float(item['price'])
+                    })
+                    summary_text += f"• {item['name']} x{qty}\n"
+
+        if not cart_items:
+            await send_whatsapp_message(phone, "❌ Error: No valid items found in cart.")
+            return
+
+        # 2. Apply Coupon
+        discount_amount = 0
+        applied_coupon_code = None
+        
+        if coupon_code:
+            coupon = await validate_coupon(shop_id, coupon_code)
+            if coupon:
+                applied_coupon_code = coupon['code']
+                if coupon['discount_type'] == 'percent':
+                    discount_amount = (subtotal * float(coupon['value'])) / 100
+                else:
+                    discount_amount = float(coupon['value'])
+                logger.info(f"✅ Coupon {coupon_code} Validated. Discount: ₹{discount_amount}")
+
+        final_total = max(0, subtotal - discount_amount)
+
+        # 3. Update State (Ready for Address Check)
+        await state_manager.set_state(phone, {
+            "state": "active", # Important to set active so address check works
+            "cart": cart_items,
+            "total": final_total,
+            "subtotal": subtotal,
+            "discount": discount_amount,
+            "shop_id": shop_id,
+            "seller_phone": seller_phone,
+            "applied_coupon": applied_coupon_code,
+            "is_bulk": True # Flag to handle bulk finalization differntly if needed
+        })
+
+        # 4. Send Confirmation & Trigger Address Check
+        msg = (
+            f"🧾 *Order Summary*\n"
+            f"------------------\n"
+            f"{summary_text}"
+            f"------------------\n"
+            f"📝 Subtotal: ₹{subtotal}\n"
+        )
+        
+        if applied_coupon_code:
+            msg += f"🏷️ Coupon ({applied_coupon_code}): -₹{discount_amount}\n"
+            
+        msg += f"💰 *Final Total: ₹{final_total}*"
+
+        # If we have an image, send it with caption
+        if hero_image_url:
+             await send_image_message(phone, hero_image_url, msg)
+        else:
+             await send_whatsapp_message(phone, msg)
+
+        # 🚀 IMMEDIATE HANDOFF TO ADDRESS CHECK
+        # This asks for address immediately after showing the summary
+        await check_address_before_payment(phone)
+
+    except Exception as e:
+        logger.error(f"🔥 CRITICAL ERROR in Bulk Handoff: {e}")
+        await send_whatsapp_message(phone, "❌ Error processing cart. Please try again.")
+
+
+# ==============================================================================
+# 3. CHECKPOINT: ADDRESS VERIFICATION
 # ==============================================================================
 async def check_address_before_payment(phone):
     """
@@ -1093,7 +1219,6 @@ async def check_address_before_payment(phone):
     
     else:
         # ❌ No Address: Show "Add Address" Button
-        # This button triggers 'CHANGE_ADDR' in webhook.py, which generates the link.
         msg = "📍 *Shipping Address Required*\n\nWe need your address to calculate shipping."
         btns = [
             {"id": "CHANGE_ADDR", "title": "➕ Add Address"}
@@ -1102,7 +1227,7 @@ async def check_address_before_payment(phone):
 
 
 # ==============================================================================
-# 3. FINALIZE ORDER (The Executor)
+# 4. FINALIZE ORDER (The Executor)
 # ==============================================================================
 async def finalize_order(phone, data, addr_id):
     """
@@ -1140,22 +1265,46 @@ async def finalize_order(phone, data, addr_id):
     status_text = "COD" if payment_method == "pay_cod" else "PENDING_PAYMENT"
 
     # 3. Prepare Order Payload
-    order_payload = {
-        "phone": phone,
-        "item_name": data.get("name", "Unknown Item"),
-        "qty": int(data.get("qty", 1)),
-        "total": total_amount,
-        "payment_method": "COD" if payment_method == "pay_cod" else "ONLINE",
-        "shop_id": shop_id,
-        "address": full_addr_str,
-        "pincode": addr['pincode'],
-        "city": addr['city'],
-        "state": addr['state'],
-        "status": status_text
-    }
+    # Check if it's bulk or single item to format the "items" JSON column
+    is_bulk = data.get("is_bulk", False)
+    
+    if is_bulk:
+        # Bulk order: items is already a list in 'cart'
+        items_json = json.dumps(data.get("cart", []))
+        item_name_summary = "Bulk Order"
+    else:
+        # Single order: construct list
+        items_json = json.dumps([{
+            "item_id": data.get("item_id"),
+            "name": data.get("name"),
+            "qty": data.get("qty"),
+            "price": data.get("price")
+        }])
+        item_name_summary = data.get("name", "Unknown Item")
 
-    # 4. SAVE TO DB
-    order_id = await save_order_to_db(order_payload)
+    # 4. SAVE TO DB (Direct Insert Logic to avoid duplicate function issues)
+    async with db.pool.acquire() as conn:
+        order_id = await conn.fetchval("""
+            INSERT INTO orders (
+                customer_phone, item_name, quantity, total_amount, payment_method, 
+                delivery_address, delivery_pincode, delivery_city, delivery_state,
+                shop_id, status, payment_status, items
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12::jsonb)
+            RETURNING id
+        """, 
+        phone,
+        item_name_summary,
+        int(data.get("qty", 1)), # Total qty or just 1 for bulk placeholder
+        total_amount,
+        "COD" if payment_method == "pay_cod" else "ONLINE",
+        full_addr_str,
+        addr['pincode'],
+        addr['city'],
+        addr['state'],
+        shop_id,
+        status_text,
+        items_json
+        )
 
     if not order_id:
         await send_whatsapp_message(phone, "❌ System Error. Could not create order.")
@@ -1168,9 +1317,9 @@ async def finalize_order(phone, data, addr_id):
         msg = (
             f"🎉 *Order Placed Successfully!* 🎉\n"
             f"🆔 Order #{order_id}\n"
-            f"📦 Item: {order_payload['item_name']} (x{order_payload['qty']})\n"
+            f"📦 Items: {item_name_summary}\n"
             f"💰 Total: ₹{total_amount}\n"
-            f"📍 Ship To: {order_payload['city']}\n\n"
+            f"📍 Ship To: {addr['city']}\n\n"
             "We will update you when it ships! 🚚"
         )
         await send_whatsapp_message(phone, msg)
@@ -1241,37 +1390,12 @@ async def finalize_order(phone, data, addr_id):
 
 
 # ==============================================================================
-# 4. DATABASE HELPERS
+# 5. UTILS & HELPERS
 # ==============================================================================
-async def save_order_to_db(data):
-    """
-    Inserts data using the Single-Item Schema.
-    """
-    async with db.pool.acquire() as conn:
-        query = """
-            INSERT INTO orders (
-                customer_phone, item_name, quantity, total_amount, payment_method, 
-                delivery_address, delivery_pincode, delivery_city, delivery_state,
-                shop_id, status, payment_status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
-            RETURNING id
-        """
-        # Safe Getters
-        return await conn.fetchval(query,
-            data['phone'],
-            data['item_name'],
-            data['qty'],
-            data['total'],
-            data['payment_method'],
-            data['address'],
-            data['pincode'],
-            data['city'],
-            data['state'],
-            data['shop_id'],
-            data['status']
-        )
-
 async def validate_coupon(shop_id, code):
+    """
+    Checks if a coupon exists and is active.
+    """
     async with db.pool.acquire() as conn:
         coupon = await conn.fetchrow("""
             SELECT * FROM coupons 
@@ -1279,16 +1403,19 @@ async def validate_coupon(shop_id, code):
         """, shop_id, code.upper())
     return coupon
 
-# ==============================================================================
-# 5. BULK & DRILLDOWN LOGIC
-# ==============================================================================
-async def handle_bulk_handoff(phone, ref_string):
-    logger.info(f"Processing Bulk: {ref_string}")
-    # (Simplified for brevity - assumes logic exists or can be pasted from previous if needed. 
-    #  For now, just ensuring it doesn't crash)
+async def save_order_to_db(data):
+    """
+    Wrapper for legacy calls - redirects to the direct insert logic inside finalize_order 
+    or can be used for upsells.
+    """
+    # NOTE: finalize_order now handles DB insertion directly to support Bulk JSON.
+    # This function is kept if other parts of your app call it directly for simple items.
     pass 
 
 async def handle_selection_drilldown(phone, text_or_id, current_data):
+    """
+    Catalog Navigation logic
+    """
     selection_id = text_or_id.strip()
     
     if selection_id.startswith("CAT_"):
@@ -1317,6 +1444,9 @@ async def handle_selection_drilldown(phone, text_or_id, current_data):
             pass
 
 async def schedule_image_deletion(order_id: int):
+    """
+    Cleanup task
+    """
     await asyncio.sleep(1800)
     async with db.pool.acquire() as conn:
         await conn.execute("UPDATE orders SET screenshot_id = NULL WHERE id = $1", order_id)
