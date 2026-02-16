@@ -475,9 +475,8 @@ async def receive_message(request: Request):
                 # --- 🚀 [FIXED] CHANGE ADDRESS (Web Link Handoff) ---
                 if selection_id == "CHANGE_ADDR":
                     # Generate the Secure Link
-                    checkout_link = create_checkout_url(phone)
+                    checkout_link = await create_checkout_url(phone)
 
-                    # Send the Reply
                     response_text = (
                         "Tap the link below to securely update your address:\n\n"
                         f"🔗 {checkout_link}\n\n"
