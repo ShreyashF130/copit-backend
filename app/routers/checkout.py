@@ -2,12 +2,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import uuid
 import json
-import logging
 from datetime import datetime, timedelta, timezone
 from app.core.database import db
-import os
 
-# Setup Logging so you can see ERRORS in your terminal
+# Setup Logging
+import logging
 logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter()
@@ -25,7 +24,7 @@ async def create_checkout_url(phone: str) -> str:
     session_uuid = str(uuid.uuid4())
     
     # 2. Calculate Expiry (10 Minutes from NOW in UTC)
-    # Using UTC prevents timezone bugs between DB and Server
+    # ⚠️ CRITICAL FIX: Use timezone.utc explicitly
     expiry_time = (datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp()
     
     # 3. Create the Payload
@@ -47,7 +46,6 @@ async def create_checkout_url(phone: str) -> str:
         return "Error_Generating_Link"
     
     # 5. Return URL 
-    # NOTE: If testing locally, ensure this matches your Frontend URL
     return f"https://copit.in/checkout/{session_uuid}" 
 
 # --- 2. API ENDPOINTS ---
@@ -61,10 +59,7 @@ async def generate_checkout_link(request: CheckoutRequest):
 async def get_session_data(session_id: str):
     logger.info(f"🔍 Searching for Session: {session_id}")
     
-    # Clean the input just in case
     clean_id = session_id.strip()
-    
-    # 1. Manual String Construction for SQL (Safer than || operator)
     search_pattern = f"{clean_id}::%"
 
     async with db.pool.acquire() as conn:
@@ -76,27 +71,24 @@ async def get_session_data(session_id: str):
     
     if not row:
         logger.warning(f"❌ Session NOT FOUND for ID: {clean_id}")
+        # Allow 404 to trigger retry on frontend
         raise HTTPException(status_code=404, detail="Link invalid or used")
 
     # 2. Extract & Check Expiry
     magic_token = row['magic_token']
     try:
-        # Split "UUID::TIMESTAMP"
         parts = magic_token.split("::")
-        if len(parts) != 2:
-            raise ValueError("Invalid Token Format")
+        if len(parts) != 2: raise ValueError("Invalid Token")
             
         _, expiry_str = parts
         expiry_ts = float(expiry_str)
         
-        # UTC Check
+        # ⚠️ CRITICAL FIX: Compare against UTC
         current_ts = datetime.now(timezone.utc).timestamp()
         
-        if current_ts > expiry_ts:
+        # Add 30-second buffer for clock skew
+        if current_ts > (expiry_ts + 30):
             logger.warning(f"⏳ Link EXPIRED. Current: {current_ts} > Expiry: {expiry_ts}")
-            # Optional: Clear expired
-            async with db.pool.acquire() as conn:
-                 await conn.execute("UPDATE users SET magic_token = NULL WHERE phone_number = $1", row['phone_number'])
             raise HTTPException(status_code=400, detail="Link expired")
             
     except ValueError as e:
@@ -110,16 +102,13 @@ async def get_session_data(session_id: str):
         data = row['saved_addresses']
         saved_address = json.loads(data) if isinstance(data, str) else data
 
-    logger.info(f"✅ Session Found for Phone: {phone}")
     return {
         "phone_masked": "******" + phone[-4:], 
         "saved_address": saved_address
     }
 
-
 @router.post("/confirm-address")
 async def confirm_address(data: AddressSubmit):
-    # 1. Validate Session
     clean_id = data.session_id.strip()
     search_pattern = f"{clean_id}::%"
 
@@ -133,33 +122,25 @@ async def confirm_address(data: AddressSubmit):
         if not row:
             raise HTTPException(status_code=400, detail="Invalid Session")
         
-        # Expiry Check
+        # Check Expiry
         _, expiry_str = row['magic_token'].split("::")
-        if datetime.now(timezone.utc).timestamp() > float(expiry_str):
+        if datetime.now(timezone.utc).timestamp() > (float(expiry_str) + 30):
             raise HTTPException(status_code=400, detail="Link expired")
         
         phone = row['phone_number']
-        addr = data.address # This is now the dictionary with pincode, house_no, etc.
-
-        # 2. INSERT INTO 'addresses' TABLE (Structured Data)
-        # We assume your 'addresses' table has user_id as foreign key to users(phone_number)
-        address_id = await conn.fetchval("""
-            INSERT INTO addresses 
-            (user_id, pincode, house_no, area, landmark, city, state, is_default)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
-            RETURNING id
+        
+        # ⚠️ STRUCTURAL FIX: Save to Addresses Table directly
+        addr = data.address
+        await conn.execute("""
+            INSERT INTO addresses (user_id, pincode, house_no, area, landmark, city, state, is_default, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW())
         """, phone, addr.get("pincode"), addr.get("house_no"), addr.get("area"), 
              addr.get("landmark"), addr.get("city"), addr.get("state"))
 
-        # 3. ALSO UPDATE 'users' JSON (For backward compatibility/caching)
-        # And KILL the token
-        await conn.execute("""
-            UPDATE users 
-            SET saved_addresses = $2::jsonb, magic_token = NULL 
-            WHERE phone_number = $1
-        """, phone, json.dumps(addr))
+        # Clear Token
+        await conn.execute("UPDATE users SET magic_token = NULL WHERE phone_number = $1", phone)
     
-    # 4. Return WhatsApp Link
-    whatsapp_link = f"https://wa.me/{os.getenv('BOT_NUMBER')}?text=Address_Confirmed_for_{clean_id}"
+    # Return Deep Link with TRIGGER TEXT
+    whatsapp_link = f"https://wa.me/91YOUR_BOT_NUMBER?text=Address_Confirmed_for_{clean_id}"
     
     return {"redirect_url": whatsapp_link}
