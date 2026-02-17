@@ -1665,7 +1665,7 @@ async def finalize_order(phone, data, addr_id):
         else:
             # ⚠️ VPA FIX: Fetch UPI ID from shop or use default
             vpa = shop.get('upi_id') if shop else "shop@upi"
-            pay_url = f"https://copit.in/pay/manual?amount={total_amount}&order={order_id}&vpa={vpa}"
+            pay_url = f"https://copit.in/pay/manual?order={order_id}"
             
             await send_whatsapp_message(phone, f"💳 *Pay Here:* {pay_url}\n\n👇 Tap the link to pay securely.")
             

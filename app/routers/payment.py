@@ -114,5 +114,49 @@ async def create_payment_order(request: Request):
     except Exception as e:
         print(f"Razorpay Error: {e}")
         raise HTTPException(status_code=500, detail="Internal Payment Failure")
+    
+
+# ... existing imports ...
+from fastapi import APIRouter, Request, HTTPException
+from app.core.database import db
+
+# router is already defined in your code
+# router = APIRouter()
+
+# ----------------------------------------------------------------------
+# ⚠️ NEW SECURE ENDPOINT: Get Real Order Details
+# ----------------------------------------------------------------------
+@router.get("/order/{order_id}")
+async def get_secure_order_details(order_id: int):
+    """
+    Fetches the TRUE amount and VPA for an order.
+    Prevents users from manipulating the URL to pay less.
+    """
+    async with db.pool.acquire() as conn:
+        # 1. Get Order Amount & Shop ID
+        order = await conn.fetchrow("""
+            SELECT id, total_amount, shop_id, status 
+            FROM orders WHERE id = $1
+        """, order_id)
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # 2. Get Shop's UPI ID (VPA)
+        shop = await conn.fetchrow("""
+            SELECT name, upi_id FROM shops WHERE id = $1
+        """, order['shop_id'])
+        
+        # Fallback VPA if shop hasn't set one
+        vpa = shop['upi_id'] if shop and shop['upi_id'] else "shop@upi"
+        shop_name = shop['name'] if shop else "Merchant"
+
+    return {
+        "order_id": order['id'],
+        "amount": float(order['total_amount']), # 🔒 Source of Truth
+        "vpa": vpa,                             # 🔒 Source of Truth
+        "shop_name": shop_name,
+        "status": order['status']
+    }
 
 
