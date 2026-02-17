@@ -1465,6 +1465,7 @@
 import logging
 import json
 import asyncio
+import re  # <--- Added Regex for reliable parsing
 from app.core.database import db
 from app.utils.state_manager import state_manager
 from app.utils.whatsapp import (
@@ -1484,7 +1485,6 @@ async def handle_web_handoff(phone, item_id, referrer=None):
     logger.info(f"📦 START: Web Handoff for {phone} | Item: {item_id}")
     try:
         async with db.pool.acquire() as conn:
-            # Query matches your 'items' table schema
             item = await conn.fetchrow("""
                 SELECT id, name, price, stock_count, image_url, description, shop_id 
                 FROM items WHERE id = $1
@@ -1495,13 +1495,11 @@ async def handle_web_handoff(phone, item_id, referrer=None):
             await send_whatsapp_message(phone, "❌ Item discontinued or not found.")
             return
 
-        # Check stock_count
         if item['stock_count'] <= 0:
             logger.info(f"⚠️ Item {item_id} is OUT OF STOCK")
             await send_whatsapp_message(phone, f"😢 Sorry, *{item['name']}* is currently out of stock.")
             return
 
-        # Initialize State
         await state_manager.update_state(phone, {
             "state": "awaiting_qty",
             "item_id": item['id'],
@@ -1529,47 +1527,71 @@ async def handle_web_handoff(phone, item_id, referrer=None):
 async def handle_bulk_handoff(phone, ref_string):
     logger.info(f"🛒 START: Bulk Handoff for {phone} | Ref: {ref_string}")
     try:
-        # Parse ref string: buy_bulk_1:2,2:1_COUPON:XYZ
-        items_part = ref_string.replace("buy_bulk_", "").split("_COUPON:")[0]
-        raw_items = items_part.split(",")
-        cart_items, subtotal, shop_id, hero_img = [], 0, None, None
+        # 1. ROBUST PARSING using Regex
+        # Finds all pairs of digits separated by colon (e.g. "26:2", "27:1")
+        # This ignores "buy_bulk_", "COUPON", spaces, or other noise.
+        pairs = re.findall(r'(\d+):(\d+)', ref_string)
+        
+        if not pairs:
+            logger.warning(f"⚠️ No valid ID:Qty pairs found in string: {ref_string}")
+            await send_whatsapp_message(phone, "❌ Could not load cart items.")
+            return
+
+        cart_items = []
+        subtotal = 0
+        shop_id = None
+        hero_img = None 
 
         async with db.pool.acquire() as conn:
-            for entry in raw_items:
-                if ":" not in entry: continue
-                try: i_id, qty = map(int, entry.split(":"))
-                except: continue
+            for item_id_str, qty_str in pairs:
+                item_id = int(item_id_str)
+                qty = int(qty_str)
                 
-                item = await conn.fetchrow("SELECT name, price, image_url, shop_id FROM items WHERE id = $1", i_id)
+                # Fetch Item
+                item = await conn.fetchrow("SELECT name, price, image_url, shop_id FROM items WHERE id = $1", item_id)
+                
                 if item:
                     line_total = float(item['price']) * qty
                     subtotal += line_total
-                    shop_id = item['shop_id']
+                    shop_id = item['shop_id'] # Takes the shop ID of the last item
                     if not hero_img: hero_img = item['image_url']
+                    
                     cart_items.append({
                         "name": item['name'],
                         "qty": qty,
                         "price": float(item['price'])
                     })
+                else:
+                    logger.warning(f"⚠️ Item ID {item_id} from bulk string not found in DB")
 
         if not cart_items:
-            logger.warning(f"⚠️ Cart Empty for {phone} after parsing")
-            await send_whatsapp_message(phone, "❌ Error: Cart is empty.")
+            logger.warning(f"⚠️ Cart Empty. Parsed IDs valid but not found in DB.")
+            await send_whatsapp_message(phone, "❌ Error: Items in cart are no longer available.")
             return
 
+        # 2. Update State
         await state_manager.set_state(phone, {
-            "state": "active", "cart": cart_items, "total": subtotal, "subtotal": subtotal, "shop_id": shop_id, "is_bulk": True
+            "state": "active", 
+            "cart": cart_items, 
+            "total": subtotal, 
+            "subtotal": subtotal, 
+            "shop_id": shop_id, 
+            "is_bulk": True
         })
-        logger.info(f"✅ Bulk State Set. Total: {subtotal}")
+        logger.info(f"✅ Bulk State Set. Items: {len(cart_items)} | Total: {subtotal}")
 
+        # 3. Send Summary
         msg = f"🧾 *Order Summary*\n------------------\n"
         for i in cart_items:
             msg += f"• {i['name']} x{i['qty']}\n"
         msg += f"------------------\n💰 *Final Total: ₹{subtotal}*"
 
-        if hero_img: await send_image_message(phone, hero_img, msg)
-        else: await send_whatsapp_message(phone, msg)
+        if hero_img: 
+            await send_image_message(phone, hero_img, msg)
+        else: 
+            await send_whatsapp_message(phone, msg)
 
+        # 4. Trigger Address Check
         await check_address_before_payment(phone)
 
     except Exception as e:
@@ -1637,7 +1659,7 @@ async def finalize_order(phone, data, addr_id):
 
             pay_status = 'cod_pending' if payment_method == "COD" else 'awaiting_proof'
 
-            # ⚠️ DB INSERT (Matches your 'orders' schema)
+            # ⚠️ DB INSERT
             logger.info("💾 Inserting Order into DB...")
             order_id = await conn.fetchval("""
                 INSERT INTO orders (
@@ -1668,11 +1690,10 @@ async def finalize_order(phone, data, addr_id):
         await send_whatsapp_message(phone, "❌ Error saving order. Please contact support.")
 
 # ==============================================================================
-# 3. UTILS & HELPERS (Restored)
+# 3. UTILS & HELPERS
 # ==============================================================================
 async def handle_selection_drilldown(phone, text_or_id, current_data):
     logger.info(f"📂 Drilldown: {text_or_id}")
-    # Add category logic here if needed
     pass
 
 async def validate_coupon(shop_id, code):
@@ -1680,7 +1701,6 @@ async def validate_coupon(shop_id, code):
         return await conn.fetchrow("SELECT * FROM coupons WHERE shop_id = $1 AND code = $2 AND is_active = TRUE", shop_id, code.upper())
 
 async def save_order_to_db(data):
-    # Used for Upsells
     logger.info(f"💾 Saving Upsell Order for {data.get('phone')}")
     async with db.pool.acquire() as conn:
         return await conn.fetchval("""
@@ -1689,5 +1709,4 @@ async def save_order_to_db(data):
         """, data['phone'], data['item_name'], data['qty'], data['total'], data['payment_method'], data['shop_id'])
 
 async def schedule_image_deletion(order_id: int):
-    # Placeholder to prevent import errors in admin.py
     pass
