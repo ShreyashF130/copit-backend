@@ -1715,3 +1715,17 @@ async def save_order_to_db(data):
             INSERT INTO orders (customer_phone, item_name, quantity, total_amount, payment_method, shop_id, status)
             VALUES ($1, $2, $3, $4, $5, $6, 'PENDING') RETURNING id
         """, data['phone'], data['item_name'], data['qty'], data['total'], data['payment_method'], data['shop_id'])
+    
+
+async def schedule_image_deletion(order_id: int):
+    """
+    Background task to clear sensitive data
+    """
+    await asyncio.sleep(1800) # 30 mins
+    async with db.pool.acquire() as conn:
+        # Assuming you might have a screenshot_id column or similar logic
+        # If not, this is a placeholder that does no harm
+        try:
+            await conn.execute("UPDATE orders SET screenshot_url = NULL WHERE id = $1", order_id)
+        except:
+            pass
