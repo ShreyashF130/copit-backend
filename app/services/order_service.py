@@ -1667,7 +1667,7 @@ async def finalize_order(phone, data, addr_id):
             vpa = shop.get('upi_id') if shop else "shop@upi"
             pay_url = f"https://copit.in/pay/manual?order={order_id}"
             
-            await send_whatsapp_message(phone, f"💳 *Pay Here:* {pay_url}\n\n👇 Tap the link to pay securely.")
+            await send_whatsapp_message(phone, f"💳 *Pay Here:* {pay_url}\n\n👇 Tap the link to pay securely.And send [Transaction Id or Screenshot] of Payment to confirm")
             
             # Start Background Deletion Task (e.g. for future screenshots)
             asyncio.create_task(schedule_image_deletion(order_id))
