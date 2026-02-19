@@ -74,7 +74,7 @@ from app.services.recovery_service import cart_recovery_loop
 from app.services.delivery_service import delivery_watchdog_loop
 
 # Import Routers
-from app.routers import checkout, webhook, admin, payment, storefront
+from app.routers import checkout, webhook, admin, payment, storefront,dashboard
 
 # 3. LIFESPAN
 @asynccontextmanager
@@ -128,6 +128,7 @@ app.include_router(admin.router, prefix="/api")
 app.include_router(payment.router, prefix="/api")
 app.include_router(storefront.router, prefix="/api")
 app.include_router(checkout.router) 
+app.include_router(dashboard.router)
 
 @app.get("/")
 def health_check():
