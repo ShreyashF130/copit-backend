@@ -1620,9 +1620,12 @@ async def finalize_order(phone, data, addr_id):
         payment_method = "COD" if pay_raw == "pay_cod" else "ONLINE"
 
         async with db.pool.acquire() as conn:
-            # 1. Fetch Address & Shop Details (Including UPI ID)
+            # 1. ⚠️ THE FIX: Fetch active_payment_method and razorpay keys
             addr = await conn.fetchrow("SELECT * FROM addresses WHERE id = $1", int(addr_id))
-            shop = await conn.fetchrow("SELECT name, upi_id FROM shops WHERE id = $1", int(shop_id))
+            shop = await conn.fetchrow("""
+                SELECT name, upi_id, active_payment_method, razorpay_key_id 
+                FROM shops WHERE id = $1
+            """, int(shop_id))
 
             if not addr:
                 await send_whatsapp_message(phone, "❌ Address Error. Try again.")
@@ -1630,7 +1633,7 @@ async def finalize_order(phone, data, addr_id):
 
             full_addr = f"{addr['house_no']}, {addr['area']}, {addr['city']} - {addr['pincode']}"
 
-            # 2. Schema Mapping (Bulk vs Single)
+            # 2. Schema Mapping
             if data.get("is_bulk"):
                 item_list = [f"{i['name']} (x{i['qty']})" for i in data.get("cart", [])]
                 final_item_name = ", ".join(item_list)[:500] 
@@ -1639,6 +1642,7 @@ async def finalize_order(phone, data, addr_id):
                 final_item_name = data.get("name", "Item")
                 final_qty = int(data.get("qty", 1))
 
+            # Set payment status (Online is pending until proven otherwise)
             pay_status = 'cod_pending' if payment_method == "COD" else 'awaiting_proof'
 
             # 3. DB Insert
@@ -1657,27 +1661,40 @@ async def finalize_order(phone, data, addr_id):
             )
             logger.info(f"✅ Order Created: ID {order_id}")
 
-        # 4. Routing
+        # =========================================================
+        # 4. ⚠️ THE ROUTING FIX (Razorpay vs Manual)
+        # =========================================================
         if payment_method == "COD":
             msg = f"🎉 *Order #{order_id} Confirmed!*\n📦 {final_item_name}\n💰 Total: ₹{total_amount}\n🚚 Shipping to {addr['city']}"
             await send_whatsapp_message(phone, msg)
             await state_manager.clear_state(phone)
-        else:
-            # ⚠️ VPA FIX: Fetch UPI ID from shop or use default
-            vpa = shop.get('upi_id') if shop else "shop@upi"
-            pay_url = f"https://copit.in/pay/manual?order={order_id}"
             
-            await send_whatsapp_message(phone, f"💳 *Pay Here:* {pay_url}\n\n👇 Tap the link to pay securely.And send [Transaction Id or Screenshot] of Payment to confirm")
+        else: # ONLINE PAYMENT
             
-            # Start Background Deletion Task (e.g. for future screenshots)
-            asyncio.create_task(schedule_image_deletion(order_id))
+            # Check if shop uses Razorpay AND has configured their keys
+            uses_razorpay = shop and shop.get('active_payment_method') == 'razorpay' and shop.get('razorpay_key_id')
             
-            await state_manager.update_state(phone, {"state": "awaiting_screenshot", "order_id": order_id})
+            if uses_razorpay:
+                # --- RAZORPAY FLOW (PRO) ---
+                pay_url = f"https://copit.in/pay/online?order={order_id}"
+                msg = f"💳 *Pay Securely via Razorpay:*\n{pay_url}\n\n👇 Tap the link to pay. Your order will auto-confirm once successful."
+                await send_whatsapp_message(phone, msg)
+                
+                # We DO NOT wait for a screenshot. Clear the state. The Razorpay Webhook handles the rest.
+                await state_manager.clear_state(phone)
+                
+            else:
+                # --- MANUAL UPI FLOW (FREE/DEFAULT) ---
+                pay_url = f"https://copit.in/pay/manual?order={order_id}"
+                msg = f"💳 *Pay Here:* {pay_url}\n\n👇 Tap the link to pay securely.\n⚠️ *Important:* Send the [Transaction Id or Screenshot] here to confirm your order."
+                await send_whatsapp_message(phone, msg)
+                
+                asyncio.create_task(schedule_image_deletion(order_id))
+                await state_manager.update_state(phone, {"state": "awaiting_screenshot", "order_id": order_id})
 
     except Exception as e:
         logger.error(f"🔥 Finalize Error: {e}", exc_info=True)
         await send_whatsapp_message(phone, "❌ Error saving order. Please contact support.")
-
 # ==============================================================================
 # 3. UTILS & HELPERS
 # ==============================================================================
