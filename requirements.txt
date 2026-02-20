@@ -12,3 +12,4 @@ openpyxl
 python-multipart
 python-jose[cryptography]
 passlib[bcrypt]
+cryptography==42.0.5
