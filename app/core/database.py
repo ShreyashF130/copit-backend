@@ -2,7 +2,8 @@ import asyncpg
 import os
 import asyncio
 import ssl
-
+from cryptography.fernet import Fernet
+# print(Fernet.generate_key().decode())
 class Database:
     def __init__(self):
         self.pool = None
@@ -28,6 +29,8 @@ class Database:
                     command_timeout=60
                 )
                 print("✅ DB Connected")
+                # print(Fernet.generate_key().decode())
+
                 return # Exit loop on success
             
             except Exception as e:
