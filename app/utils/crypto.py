@@ -7,6 +7,7 @@ logger = logging.getLogger("drop_bot")
 # Load the Master Key
 MASTER_KEY = os.getenv("ENCRYPTION_MASTER_KEY")
 
+
 if not MASTER_KEY:
     logger.warning("🔥 CRITICAL: ENCRYPTION_MASTER_KEY is missing! Keys will not be encrypted.")
     cipher_suite = None
