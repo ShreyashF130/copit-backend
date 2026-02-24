@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from app.core.database import db
 from fastapi import APIRouter, Query
 from app.core.database import db
+from app.utils.crypto import decrypt_data
 from app.utils.shiprocket import get_shiprocket_token, check_serviceability
 
 router = APIRouter()
@@ -81,12 +82,11 @@ async def get_reviews(shop_id: int):
 
 
 
+from app.utils.crypto import decrypt_data
+
 @router.get("/check-pincode")
 async def check_pincode(shop_id: int, pincode: str):
     async with db.pool.acquire() as conn:
-        # 1. Get Shop Credentials & Pickup Pincode
-        # (Note: You need to store the Seller's Pickup Pincode in the 'shops' table for this to work accurately)
-        # For now, we assume you might have added 'pickup_pincode' to shops table, or we use a default.
         shop = await conn.fetchrow("""
             SELECT shiprocket_email, shiprocket_password, pickup_address 
             FROM shops WHERE id = $1
@@ -94,18 +94,18 @@ async def check_pincode(shop_id: int, pincode: str):
         
         if not shop or not shop['shiprocket_email']:
             return {"status": "error", "message": "Seller shipping not configured."}
+        
+        # 1. 🔓 Decrypt Password
+        decrypted_password = decrypt_data(shop['shiprocket_password'])
 
-        # 2. Authenticate
-        token = get_shiprocket_token(shop['shiprocket_email'], shop['shiprocket_password'])
+        # 2. 🔑 Authenticate (USE THE DECRYPTED ONE)
+        token = get_shiprocket_token(shop['shiprocket_email'], decrypted_password)
         if not token:
             return {"status": "error", "message": "Service unavailable."}
             
         # 3. Check Serviceability
-        # We assume a default pickup pincode if not in DB, e.g., '400050' (Mumbai). 
-        # Ideally, fetch this from the shop's saved pickup address details in Shiprocket or DB.
-        # Let's assume you add a column 'pickup_pincode' to your shops table later.
-        seller_pincode = "400001" # REPLACE THIS with actual seller pincode logic
+        # Enterprise tip: Add 'pickup_pincode' to your shops table soon!
+        seller_pincode = "400001" 
         
         result = check_serviceability(token, seller_pincode, pincode, weight=0.5, cod=True)
-        
         return result
