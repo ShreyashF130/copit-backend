@@ -253,6 +253,19 @@ async def universal_razorpay_webhook(request: Request):
             SET payment_status = 'paid', status = 'processing', transaction_id = $1
             WHERE id = $2
         """, payment['id'], db_order_id)
+        # 5. The "Aware" Notification System
+        order = await conn.fetchrow("SELECT customer_phone FROM orders WHERE id = $1", db_order_id)
+        if order:
+            try:
+                msg = f"🎉 *Payment Successful!*\n\nYour Order #{db_order_id} has been verified and is now processing. 📦"
+                await send_whatsapp_message(order['customer_phone'], msg)
+                
+                # Mark as Sent
+                await conn.execute("UPDATE orders SET notification_status = 'sent' WHERE id = $1", db_order_id)
+            except Exception as wa_error:
+                logger.error(f"WhatsApp Failed for Order {db_order_id}: {wa_error}")
+                # ⚠️ THE FAILSAFE: Mark as Failed so the Dashboard knows!
+                await conn.execute("UPDATE orders SET notification_status = 'failed' WHERE id = $1", db_order_id)
 
         # Notify Customer Instantly (Wrapped in try/except so it doesn't crash the webhook response)
         try:
@@ -264,4 +277,47 @@ async def universal_razorpay_webhook(request: Request):
             logger.error(f"Webhook WhatsApp Notification Failed: {wa_error}")
                     
     return {"status": "ok"}
+
+
+@router.post("/webhooks/shiprocket/universal")
+async def shiprocket_webhook(request: Request):
+    # Shiprocket sends a massive JSON payload when tracking status changes
+    payload = await request.json()
+    
+    # We only care about the specific tracking update
+    awb = payload.get('awb')
+    current_status = payload.get('current_status') # e.g., 'DELIVERED', 'RTO INITIATED', 'IN TRANSIT'
+    
+    if not awb or not current_status:
+        return {"status": "ignored"}
+
+    status_lower = current_status.lower()
+
+    # Map Shiprocket statuses to your Supabase schema
+    db_status = 'shipped'
+    if status_lower == 'delivered':
+        db_status = 'delivered'
+    elif status_lower in ['rto initiated', 'rto delivered', 'returned']:
+        db_status = 'returned'
+    elif status_lower in ['out for delivery']:
+        db_status = 'out_for_delivery'
+
+    async with db.pool.acquire() as conn:
+        # Update the database using the AWB tracking number
+        order = await conn.fetchrow("""
+            UPDATE orders 
+            SET delivery_status = $1 
+            WHERE awb_code = $2
+            RETURNING id, customer_phone, item_name
+        """, db_status, awb)
+
+        # Optional: Send WhatsApp when Out for Delivery!
+        if order and db_status == 'out_for_delivery':
+            wa_msg = f"🚚 *Out for Delivery!*\n\nYour order '{order['item_name']}' is out for delivery today. Please keep your phone reachable."
+            try:
+                await send_whatsapp_message(order['customer_phone'], wa_msg)
+            except Exception as e:
+                pass # Silent fail for tracking updates
+
+    return {"status": "success"}
 
