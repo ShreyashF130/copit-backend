@@ -1,9 +1,10 @@
 from fastapi import APIRouter
 from app.core.database import db
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query,HTTPException
 from app.core.database import db
 from app.utils.crypto import decrypt_data
 from app.utils.shiprocket import get_shiprocket_token, check_serviceability
+
 
 router = APIRouter()
 
@@ -112,3 +113,40 @@ async def check_pincode(shop_id: int, pincode: str):
         
         result = check_serviceability(token, seller_pincode, pincode, weight=0.5, cod=True)
         return result
+
+
+@router.get("/storefront/{shop_slug}/item/{item_slug}")
+async def get_public_item(shop_slug: str, item_slug: str):
+    async with db.pool.acquire() as conn:
+        # 1. Validate the Shop
+        shop = await conn.fetchrow("""
+            SELECT id, name, phone_number, logo_url, slug 
+            FROM shops WHERE slug = $1 OR username = $1
+        """, shop_slug)
+        
+        if not shop:
+            raise HTTPException(status_code=404, detail="Shop not found")
+
+        # 2. Fetch the specific item using the item_slug AND shop_id
+        item = await conn.fetchrow("""
+            SELECT * FROM items 
+            WHERE shop_id = $1 AND slug = $2
+        """, shop['id'], item_slug)
+
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        # 3. Fetch 4 "More from this shop" items
+        more_items = await conn.fetch("""
+            SELECT id, name, price, image_url, slug
+            FROM items 
+            WHERE shop_id = $1 AND id != $2 AND stock_quantity > 0
+            LIMIT 4
+        """, shop['id'], item['id'])
+
+    return {
+        "status": "success",
+        "shop": dict(shop),
+        "item": dict(item),
+        "more_items": [dict(i) for i in more_items]
+    }
