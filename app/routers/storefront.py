@@ -8,20 +8,21 @@ from app.utils.shiprocket import get_shiprocket_token, check_serviceability
 router = APIRouter()
 
 @router.get("/storefront/{slug}")
-async def get_storefront(slug:str):
+async def get_storefront(slug: str):
     async with db.pool.acquire() as conn:
-        # 1. Fetch Shop Details
+        # 1. Fetch Shop Details (Fixed the WHERE clause)
         shop = await conn.fetchrow("""
-            SELECT id, name, phone_number, plan_type, logo_url
-            FROM shops WHERE id = $1
+            SELECT id, name, phone_number, plan_type, logo_url, slug, username, return_policy
+            FROM shops 
+            WHERE slug = $1 OR username = $1
         """, slug)
         
         if not shop:
             return {"status": "error", "message": "Shop not found"}
 
         shop_id = shop['id']
+        
         # 2. Fetch Active Products
-        # Ensuring we get stock_quantity and attributes so the frontend doesn't show "Sold Out"
         items = await conn.fetch("""
             SELECT id, name, price, image_url, category, description, stock_quantity, attributes
             FROM items 
@@ -38,10 +39,11 @@ async def get_storefront(slug:str):
             LIMIT 5
         """, shop_id)
 
-    # Convert Record objects to dicts explicitly
+    # Convert Record objects to dicts explicitly, with a failsafe for NULL stock
     items_list = []
     for i in items:
         item_dict = dict(i)
+        item_dict['stock_quantity'] = item_dict.get('stock_quantity') or 0
         items_list.append(item_dict)
 
     return {
