@@ -115,8 +115,8 @@ async def check_pincode(shop_id: int, pincode: str):
         return result
 
 
-@router.get("/storefront/{shop_slug}/item/{item_slug}")
-async def get_public_item(shop_slug: str, item_slug: str):
+@router.get("/storefront/{shop_slug}/products/{product_slug}")
+async def get_public_item(shop_slug: str, product_slug: str):
     async with db.pool.acquire() as conn:
         # 1. Validate the Shop
         shop = await conn.fetchrow("""
@@ -127,11 +127,11 @@ async def get_public_item(shop_slug: str, item_slug: str):
         if not shop:
             raise HTTPException(status_code=404, detail="Shop not found")
 
-        # 2. Fetch the specific item using the item_slug AND shop_id
+        # 2. Fetch the specific item using the product_slug AND shop_id
         item = await conn.fetchrow("""
             SELECT * FROM items 
             WHERE shop_id = $1 AND slug = $2
-        """, shop['id'], item_slug)
+        """, shop['id'], product_slug)
 
         if not item:
             raise HTTPException(status_code=404, detail="Item not found")
