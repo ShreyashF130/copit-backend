@@ -6,18 +6,19 @@ from app.utils.shiprocket import get_shiprocket_token, check_serviceability
 
 router = APIRouter()
 
-@router.get("/storefront/{shop_id}")
-async def get_storefront(shop_id: int):
+@router.get("/storefront/{slug}")
+async def get_storefront(slug:str):
     async with db.pool.acquire() as conn:
         # 1. Fetch Shop Details
         shop = await conn.fetchrow("""
             SELECT id, name, phone_number, plan_type, logo_url
             FROM shops WHERE id = $1
-        """, shop_id)
+        """, slug)
         
         if not shop:
             return {"status": "error", "message": "Shop not found"}
 
+        shop_id = shop['id']
         # 2. Fetch Active Products
         # Ensuring we get stock_quantity and attributes so the frontend doesn't show "Sold Out"
         items = await conn.fetch("""
