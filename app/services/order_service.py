@@ -1674,7 +1674,7 @@ async def finalize_order(phone, data, addr_id):
             wa_msg = (
                 f"🎉 *Order #{order_id} Confirmed!*\n\n"
                 f"📦 *Item:* {order['item_name']}\n"
-                f"🚚 *Shipping to:* {order['city']}\n"
+                f"🚚 *Shipping to:* {order['delivery_city']}\n"
                 f"💵 *Payment:* Cash on Delivery (COD)\n\n"
                 f"⚠️ *Important:* Please keep *₹{order['total_amount']}* ready at the time of delivery.\n\n"
                 f"🛍️ *Explore more from {order['shop_name']}:*\n"
