@@ -139,9 +139,6 @@ async def razorpay_webhook(request: Request):
 # ==============================================================================
 # 4. CUSTOMER PAYMENT CREATION (Customer paying a Shop)
 # ==============================================================================
-# ==============================================================================
-# 4. CUSTOMER PAYMENT CREATION (Customer paying a Shop)
-# ==============================================================================
 @router.post("/payment/customer/create")
 async def create_customer_order(request: Request):
     """Generates a Razorpay Order ID for a Customer paying a Shop"""

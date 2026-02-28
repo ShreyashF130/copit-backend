@@ -52,7 +52,12 @@ async def verify_payment(
     # Now you can access data safely with dot notation
     order_id = body.order_id
     decision = body.decision
-    
+    order = await conn.fetchrow("""
+            SELECT o.customer_phone, s.name as shop_name, s.slug as shop_slug 
+            FROM orders o 
+            JOIN shops s ON o.shop_id = s.id 
+            WHERE o.id = $1
+        """, order_id)
     async with db.pool.acquire() as conn:
         order = await conn.fetchrow("SELECT customer_phone FROM orders WHERE id = $1", order_id)
         if not order: 
@@ -60,7 +65,12 @@ async def verify_payment(
 
         if decision == "APPROVE":
             await conn.execute("UPDATE orders SET payment_status = 'paid', status = 'processing' WHERE id = $1", order_id)
-            msg = f"🎉 Payment Verified! Order #{order_id} confirmed."
+            msg = (
+                    f"🎉 *Payment Verified!*\n"
+                    f"Your Order #{order_id} with {order['shop_name']} is confirmed. We are packing it now! 📦\n\n"
+                    f"🛍️ *Explore more from our store:*\n"
+                    f"https://copit.in/shop/{order['shop_slug']}"
+                )
         else:
             await conn.execute("UPDATE orders SET payment_status = 'failed', status = 'cancelled' WHERE id = $1", order_id)
             msg = f"⚠️ Payment Rejected for Order #{order_id}."
@@ -171,8 +181,10 @@ async def resend_receipt(
     async with db.pool.acquire() as conn:
         # 1. Fetch the order details
         order = await conn.fetchrow("""
-            SELECT customer_phone, payment_status, status 
-            FROM orders WHERE id = $1
+            SELECT customer_phone, payment_status, status ,s.name as shop_name, s.slug as shop_slug
+            FROM orders o
+            JOIN shops s ON o.shop_id = s.id
+            WHERE o.id = $1
         """, body.order_id)
         
         if not order:
@@ -182,7 +194,12 @@ async def resend_receipt(
         if order['payment_status'] != 'paid' and order['status'] != 'PAID':
             raise HTTPException(status_code=400, detail="Order is not paid yet")
 
-        msg = f"🎉 *Payment Verified!* \n\nYour Order #{body.order_id} is confirmed. We are packing it now! 📦"
+        msg = (
+                    f"🎉 *Payment Verified!*\n"
+                    f"Your Order #{body.order_id} with {order['shop_name']} is confirmed. We are packing it now! 📦\n\n"
+                    f"🛍️ *Explore more from our store:*\n"
+                    f"https://copit.in/shop/{order['shop_slug']}"
+                )
         
         # 3. Try sending the message again
         try:
@@ -203,7 +220,7 @@ async def process_shipment(
     async with db.pool.acquire() as conn:
         # 1. Fetch Order and Shop Details
         order = await conn.fetchrow("""
-            SELECT o.*, s.shiprocket_email, s.shiprocket_password, s.pickup_address, s.name as shop_name 
+            SELECT o.*, s.shiprocket_email, s.shiprocket_password, s.pickup_address, s.name as shop_name , s.slug as shop_slug
             FROM orders o
             JOIN shops s ON o.shop_id = s.id
             WHERE o.id = $1
@@ -285,7 +302,9 @@ async def process_shipment(
                 f"🎉 *Great news! Your order has been shipped.*\n\n"
                 f"📦 *Item:* {order['item_name']}\n"
                 f"🏪 *From:* {order['shop_name']}\n\n"
-                f"📍 *Track your package live here:*\n{tracking_url}"
+                f"📍 *Track your package live here:*\n{tracking_url}\n\n"
+                f"🛍️ *Shop again:*\n"
+                f"https://copit.in/shop/{order['shop_slug']}"
             )
             try:
                 await send_whatsapp_message(order['customer_phone'], wa_msg)
