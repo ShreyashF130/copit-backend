@@ -1661,11 +1661,25 @@ async def finalize_order(phone, data, addr_id):
             )
             logger.info(f"✅ Order Created: ID {order_id}")
 
+            order = await conn.fetchrow("""
+                        SELECT o.*, s.shiprocket_email, s.shiprocket_password, s.pickup_address, s.name as shop_name, s.slug as shop_slug 
+                        FROM orders o
+                        JOIN shops s ON o.shop_id = s.id
+                        WHERE o.id = $1
+                    """, order_id)
         # =========================================================
         # 4. ⚠️ THE ROUTING FIX (Razorpay vs Manual)
         # =========================================================
         if payment_method == "COD":
-            msg = f"🎉 *Order #{order_id} Confirmed!*\n📦 {final_item_name}\n💰 Total: ₹{total_amount}\n🚚 Shipping to {addr['city']}"
+            wa_msg = (
+                f"🎉 *Order #{order_id} Confirmed!*\n\n"
+                f"📦 *Item:* {order['item_name']}\n"
+                f"🚚 *Shipping to:* {order['city']}\n"
+                f"💵 *Payment:* Cash on Delivery (COD)\n\n"
+                f"⚠️ *Important:* Please keep *₹{order['total_amount']}* ready at the time of delivery.\n\n"
+                f"🛍️ *Explore more from {order['shop_name']}:*\n"
+                f"https://copit.in/shop/{order['shop_slug']}"
+            )
             await send_whatsapp_message(phone, msg)
             await state_manager.clear_state(phone)
             

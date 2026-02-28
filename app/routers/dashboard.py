@@ -46,31 +46,34 @@ async def verify_admin(x_admin_secret: str = Header(..., alias="x-admin-secret")
 
 @router.post("/dashboard/verify-order")
 async def verify_payment(
-    body: VerifyRequest,  # <--- Use Pydantic Model here
+    body: VerifyRequest,
     authorized: bool = Depends(verify_admin)
 ):
-    # Now you can access data safely with dot notation
     order_id = body.order_id
     decision = body.decision
-    order = await conn.fetchrow("""
+    
+    # ✅ THE FIX: Open the database connection FIRST
+    async with db.pool.acquire() as conn:
+        
+        # Now it is safe to fetch the order and shop details
+        order = await conn.fetchrow("""
             SELECT o.customer_phone, s.name as shop_name, s.slug as shop_slug 
             FROM orders o 
             JOIN shops s ON o.shop_id = s.id 
             WHERE o.id = $1
         """, order_id)
-    async with db.pool.acquire() as conn:
-        order = await conn.fetchrow("SELECT customer_phone FROM orders WHERE id = $1", order_id)
+        
         if not order: 
             raise HTTPException(404, "Order not found")
 
         if decision == "APPROVE":
             await conn.execute("UPDATE orders SET payment_status = 'paid', status = 'processing' WHERE id = $1", order_id)
             msg = (
-                    f"🎉 *Payment Verified!*\n"
-                    f"Your Order #{order_id} with {order['shop_name']} is confirmed. We are packing it now! 📦\n\n"
-                    f"🛍️ *Explore more from our store:*\n"
-                    f"https://copit.in/shop/{order['shop_slug']}"
-                )
+                f"🎉 *Payment Verified!*\n"
+                f"Your Order #{order_id} with {order['shop_name']} is confirmed. We are packing it now! 📦\n\n"
+                f"🛍️ *Explore more from our store:*\n"
+                f"https://copit.in/shop/{order['shop_slug']}"
+            )
         else:
             await conn.execute("UPDATE orders SET payment_status = 'failed', status = 'cancelled' WHERE id = $1", order_id)
             msg = f"⚠️ Payment Rejected for Order #{order_id}."
