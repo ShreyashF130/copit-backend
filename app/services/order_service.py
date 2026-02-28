@@ -1671,7 +1671,7 @@ async def finalize_order(phone, data, addr_id):
         # 4. ⚠️ THE ROUTING FIX (Razorpay vs Manual)
         # =========================================================
         if payment_method == "COD":
-            wa_msg = (
+            msg = (
                 f"🎉 *Order #{order_id} Confirmed!*\n\n"
                 f"📦 *Item:* {order['item_name']}\n"
                 f"🚚 *Shipping to:* {order['delivery_city']}\n"
