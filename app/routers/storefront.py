@@ -13,7 +13,7 @@ async def get_storefront(slug: str):
     async with db.pool.acquire() as conn:
         # 1. Fetch Shop Details (Fixed the WHERE clause)
         shop = await conn.fetchrow("""
-            SELECT id, name, phone_number, plan_type, logo_url, slug, username, return_policy
+            SELECT id, name, phone_number, plan_type, logo_url, slug, username, return_policy,instagram_handle
             FROM shops 
             WHERE slug = $1 OR username = $1
         """, slug)
@@ -120,7 +120,7 @@ async def get_public_item(shop_slug: str, product_slug: str):
     async with db.pool.acquire() as conn:
         # 1. Validate the Shop
         shop = await conn.fetchrow("""
-            SELECT id, name, phone_number, logo_url, slug 
+            SELECT id, name, phone_number, logo_url, slug,instagram_handle 
             FROM shops WHERE slug = $1 OR username = $1
         """, shop_slug)
         
