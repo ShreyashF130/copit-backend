@@ -121,7 +121,7 @@ async def notify_order_update(update: StatusUpdate, background_tasks: Background
         async with db.pool.acquire() as conn:
             # Simple stock decrement (Enhancement: In future, decrement specific variant stock)
             await conn.execute("""
-                UPDATE items SET stock_quantity = stock_quantity - $1 
+                UPDATE items SET stock_count = stock_count - $1 
                 WHERE name = $2 AND shop_id = $3
             """, order['quantity'], order['item_name'].split('(')[0].strip(), order['shop_id'])
             
@@ -315,7 +315,7 @@ async def bulk_upload_items(
                 await conn.execute("""
                     INSERT INTO items (
                         shop_id, name, price, category, 
-                        description, image_url, stock_quantity
+                        description, image_url, stock_count
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """, shop_id, name, price, category, desc, img, stock)

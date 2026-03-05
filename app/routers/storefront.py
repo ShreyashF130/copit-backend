@@ -25,9 +25,9 @@ async def get_storefront(slug: str):
         
         # 2. Fetch Active Products
         items = await conn.fetch("""
-            SELECT id, name, price, image_url, category, description, stock_quantity, attributes
+            SELECT id, name, price, image_url, category, description, stock_count, attributes
             FROM items 
-            WHERE shop_id = $1 AND stock_quantity > 0
+            WHERE shop_id = $1 AND stock_count > 0
             ORDER BY category, name
         """, shop_id)
 
@@ -44,7 +44,7 @@ async def get_storefront(slug: str):
     items_list = []
     for i in items:
         item_dict = dict(i)
-        item_dict['stock_quantity'] = item_dict.get('stock_quantity') or 0
+        item_dict['stock_count'] = item_dict.get('stock_count') or 0
         items_list.append(item_dict)
 
     return {
@@ -140,7 +140,7 @@ async def get_public_item(shop_slug: str, product_slug: str):
         more_items = await conn.fetch("""
             SELECT id, name, price, image_url, slug
             FROM items 
-            WHERE shop_id = $1 AND id != $2 AND stock_quantity > 0
+            WHERE shop_id = $1 AND id != $2 AND stock_count > 0
             LIMIT 4
         """, shop['id'], item['id'])
 

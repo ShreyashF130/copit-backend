@@ -915,7 +915,7 @@
 #             items = await conn.fetch("""
 #                 SELECT id, name, price, description 
 #                 FROM items 
-#                 WHERE shop_id = $1 AND category = $2 AND stock_quantity > 0
+#                 WHERE shop_id = $1 AND category = $2 AND stock_count > 0
 #                 LIMIT 10
 #             """, shop_id, category_name)
 
