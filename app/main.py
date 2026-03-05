@@ -80,18 +80,20 @@ from app.services.delivery_service import delivery_watchdog_loop
 from app.routers import checkout, webhook, admin, payment, storefront,dashboard
 
 # 3. LIFESPAN
+# 3. LIFESPAN
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Connect DB
-    try:
-        await db.connect()
-        print("✅ Database Connected")
-        # Start Background Tasks
-        asyncio.create_task(cart_recovery_loop())
-        asyncio.create_task(delivery_watchdog_loop())
-        print("✅ System Online: All Systems Go")
-    except Exception as e:
-        print(f"🔥 Startup Error: {e}")
+    print("Initiating Database Connection...")
+    
+    # 🚨 THE FIX: No try/except block. 
+    # If this fails, the deployment crashes immediately, which is exactly what we want.
+    await db.connect()
+    print("✅ Database Connected")
+    
+    # Start Background Tasks
+    asyncio.create_task(cart_recovery_loop())
+    asyncio.create_task(delivery_watchdog_loop())
+    print("✅ System Online: All Systems Go")
     
     yield
     
