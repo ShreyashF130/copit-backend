@@ -1,19 +1,17 @@
-from fastapi import APIRouter
-from app.core.database import db
-from fastapi import APIRouter, Query,HTTPException
+import json # 🚨 THE FIX: Required to parse Postgres JSONB
+from fastapi import APIRouter, Query, HTTPException
 from app.core.database import db
 from app.utils.crypto import decrypt_data
 from app.utils.shiprocket import get_shiprocket_token, check_serviceability
-
 
 router = APIRouter()
 
 @router.get("/storefront/{slug}")
 async def get_storefront(slug: str):
     async with db.pool.acquire() as conn:
-        # 1. Fetch Shop Details (Fixed the WHERE clause)
+        # 1. Fetch Shop Details
         shop = await conn.fetchrow("""
-            SELECT id, name, phone_number, plan_type, logo_url, slug, username, return_policy,instagram_handle
+            SELECT id, name, phone_number, plan_type, logo_url, slug, username, return_policy, instagram_handle
             FROM shops 
             WHERE slug = $1 OR username = $1
         """, slug)
@@ -23,11 +21,12 @@ async def get_storefront(slug: str):
 
         shop_id = shop['id']
         
-        # 2. Fetch Active Products
+        # 🚨 FIX 1: Removed 'AND stock_count > 0'. 
+        # If we filter by stock here, complex items with 0 base stock but high variant stock get permanently hidden.
         items = await conn.fetch("""
             SELECT id, name, price, image_url, category, description, stock_count, attributes
             FROM items 
-            WHERE shop_id = $1 AND stock_count > 0
+            WHERE shop_id = $1
             ORDER BY category, name
         """, shop_id)
 
@@ -40,11 +39,24 @@ async def get_storefront(slug: str):
             LIMIT 5
         """, shop_id)
 
-    # Convert Record objects to dicts explicitly, with a failsafe for NULL stock
+    # Convert Record objects to dicts explicitly
     items_list = []
     for i in items:
         item_dict = dict(i)
         item_dict['stock_count'] = item_dict.get('stock_count') or 0
+        
+        # 🚨 FIX 2: The JSONB Parser
+        # asyncpg returns JSONB as a raw string. We MUST parse it into a Python dict 
+        # so FastAPI sends actual JSON to Next.js instead of a stringified mess.
+        attr = item_dict.get('attributes')
+        if isinstance(attr, str):
+            try:
+                item_dict['attributes'] = json.loads(attr)
+            except Exception:
+                item_dict['attributes'] = {}
+        elif attr is None:
+            item_dict['attributes'] = {}
+            
         items_list.append(item_dict)
 
     return {
@@ -84,10 +96,6 @@ async def get_reviews(shop_id: int):
     }
 
 
-
-
-from app.utils.crypto import decrypt_data
-
 @router.get("/check-pincode")
 async def check_pincode(shop_id: int, pincode: str):
     async with db.pool.acquire() as conn:
@@ -108,7 +116,6 @@ async def check_pincode(shop_id: int, pincode: str):
             return {"status": "error", "message": "Service unavailable."}
             
         # 3. Check Serviceability
-        # Enterprise tip: Add 'pickup_pincode' to your shops table soon!
         seller_pincode = "400001" 
         
         result = check_serviceability(token, seller_pincode, pincode, weight=0.5, cod=True)
@@ -120,14 +127,14 @@ async def get_public_item(shop_slug: str, product_slug: str):
     async with db.pool.acquire() as conn:
         # 1. Validate the Shop
         shop = await conn.fetchrow("""
-            SELECT id, name, phone_number, logo_url, slug,instagram_handle 
+            SELECT id, name, phone_number, logo_url, slug, instagram_handle 
             FROM shops WHERE slug = $1 OR username = $1
         """, shop_slug)
         
         if not shop:
             raise HTTPException(status_code=404, detail="Shop not found")
 
-        # 2. Fetch the specific item using the product_slug AND shop_id
+        # 2. Fetch the specific item
         item = await conn.fetchrow("""
             SELECT * FROM items 
             WHERE shop_id = $1 AND slug = $2
@@ -140,13 +147,24 @@ async def get_public_item(shop_slug: str, product_slug: str):
         more_items = await conn.fetch("""
             SELECT id, name, price, image_url, slug
             FROM items 
-            WHERE shop_id = $1 AND id != $2 AND stock_count > 0
+            WHERE shop_id = $1 AND id != $2
             LIMIT 4
         """, shop['id'], item['id'])
+
+    # 🚨 FIX 3: Parse JSON for the single item route too
+    item_dict = dict(item)
+    attr = item_dict.get('attributes')
+    if isinstance(attr, str):
+        try:
+            item_dict['attributes'] = json.loads(attr)
+        except Exception:
+            item_dict['attributes'] = {}
+    elif attr is None:
+        item_dict['attributes'] = {}
 
     return {
         "status": "success",
         "shop": dict(shop),
-        "item": dict(item),
+        "item": item_dict,
         "more_items": [dict(i) for i in more_items]
     }
