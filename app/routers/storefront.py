@@ -134,9 +134,10 @@ async def get_public_item(shop_slug: str, product_slug: str):
         if not shop:
             raise HTTPException(status_code=404, detail="Shop not found")
 
-        # 2. Fetch the specific item
+        # 2. 🚨 THE FIX: Explicitly name public columns. Never use SELECT *.
         item = await conn.fetchrow("""
-            SELECT * FROM items 
+            SELECT id, name, price, description, category, image_url, stock_count, attributes, slug 
+            FROM items 
             WHERE shop_id = $1 AND slug = $2
         """, shop['id'], product_slug)
 
@@ -151,8 +152,13 @@ async def get_public_item(shop_slug: str, product_slug: str):
             LIMIT 4
         """, shop['id'], item['id'])
 
-    # 🚨 FIX 3: Parse JSON for the single item route too
+    # 4. 🚨 THE FIX: Bulletproof Serialization
     item_dict = dict(item)
+    
+    # Guard against NULL stock in the database
+    item_dict['stock_count'] = item_dict.get('stock_count') or 0
+    
+    # Safely Parse Postgres JSONB string into a Python Dictionary
     attr = item_dict.get('attributes')
     if isinstance(attr, str):
         try:
