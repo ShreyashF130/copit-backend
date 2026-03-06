@@ -219,14 +219,20 @@ async def universal_razorpay_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Malformed payload")
 
     async with db.pool.acquire() as conn:
-        # ⚠️ IDEMPOTENCY CHECK (Don't process the same order twice)
-        order = await conn.fetchrow("SELECT payment_status FROM orders WHERE id = $1", db_order_id)
+        # 🚨 THE FIX: Fetch payment_status, phone, AND item_name in one single query from YOUR schema
+        order = await conn.fetchrow("""
+            SELECT payment_status, customer_phone, item_name 
+            FROM orders 
+            WHERE id = $1
+        """, db_order_id)
+        
         if not order:
             return {"status": "ignored"}
             
+        # ⚠️ IDEMPOTENCY CHECK
         if order['payment_status'] == 'paid':
             logger.info(f"Webhook Duplicate Ignored: Order #{db_order_id} already paid.")
-            return {"status": "ok"} # Tell Razorpay we got it, do nothing else.
+            return {"status": "ok"} 
 
         # Fetch Shop Secrets
         shop = await conn.fetchrow("SELECT razorpay_key_secret FROM shops WHERE id = $1", shop_id)
@@ -251,36 +257,22 @@ async def universal_razorpay_webhook(request: Request):
             WHERE id = $2
         """, payment['id'], db_order_id)
 
-        # 🚨 THE FIX: Fetch Customer Phone AND Item Names in one query
-        # This assumes you have an order_items table. 
-        order_info = await conn.fetchrow("""
-            SELECT 
-                o.customer_phone,
-                (SELECT string_agg(i.name, ', ') 
-                 FROM order_items oi 
-                 JOIN items i ON oi.item_id = i.id 
-                 WHERE oi.order_id = o.id) as item_names
-            FROM orders o 
-            WHERE o.id = $1
-        """, db_order_id)
-
-        # 5. The Unified, Single Notification System
-        if order_info and order_info['customer_phone']:
-            # Fallback text just in case the item query returns null
-            purchased_items = order_info['item_names'] or "your items"
+        # 5. The Single Notification System (Now using your schema's item_name)
+        try:
+            purchased_item = order['item_name'] or "your item"
+            msg = f"🎉 *Payment Successful!*\n\nYour order for *{purchased_item}* (Order #{db_order_id}) has been verified and is now processing. 📦"
             
-            try:
-                msg = f"🎉 *Payment Successful!*\n\nYour order for *{purchased_items}* (Order #{db_order_id}) has been verified and is now processing. 📦"
-                await send_whatsapp_message(order_info['customer_phone'], msg)
-                
-                # Mark as Sent
-                await conn.execute("UPDATE orders SET notification_status = 'sent' WHERE id = $1", db_order_id)
-            except Exception as wa_error:
-                logger.error(f"WhatsApp Failed for Order {db_order_id}: {wa_error}")
-                # ⚠️ THE FAILSAFE: Mark as Failed so the Dashboard knows!
-                await conn.execute("UPDATE orders SET notification_status = 'failed' WHERE id = $1", db_order_id)
+            await send_whatsapp_message(order['customer_phone'], msg)
+            
+            # Mark as Sent
+            await conn.execute("UPDATE orders SET notification_status = 'sent' WHERE id = $1", db_order_id)
+        except Exception as wa_error:
+            logger.error(f"WhatsApp Failed for Order {db_order_id}: {wa_error}")
+            # ⚠️ THE FAILSAFE: Mark as Failed so the Dashboard knows!
+            await conn.execute("UPDATE orders SET notification_status = 'failed' WHERE id = $1", db_order_id)
 
     return {"status": "ok"}
+
 
 
 @router.post("/webhooks/shiprocket/universal")
