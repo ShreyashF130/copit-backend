@@ -239,14 +239,15 @@ async def receive_message(request: Request):
                         await send_interactive_message(row['phone_number'], msg, btns)
                 return {"status": "ok"}
 
-            # --- BUYING FLOWS ---
+           # --- BUYING FLOWS ---
             if "buy_bulk_" in text:
                 await handle_bulk_handoff(phone, text)
                 return {"status": "ok"}
 
             if "buy_item_" in text:
                 match = re.search(r"buy_item_(\d+)", text)
-                if match: await handle_web_handoff(phone, int(match.group(1))) 
+                if match: 
+                    await handle_web_handoff(phone, int(match.group(1)), text) 
                 return {"status": "ok"}
             
             # --- QUANTITY ---
