@@ -219,8 +219,8 @@ async def universal_razorpay_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Malformed payload")
 
     async with db.pool.acquire() as conn:
-        # ⚠️ FIX 1: IDEMPOTENCY CHECK (Don't process the same order twice)
-        order = await conn.fetchrow("SELECT payment_status, customer_phone FROM orders WHERE id = $1", db_order_id)
+        # ⚠️ IDEMPOTENCY CHECK (Don't process the same order twice)
+        order = await conn.fetchrow("SELECT payment_status FROM orders WHERE id = $1", db_order_id)
         if not order:
             return {"status": "ignored"}
             
@@ -250,12 +250,28 @@ async def universal_razorpay_webhook(request: Request):
             SET payment_status = 'paid', status = 'processing', transaction_id = $1
             WHERE id = $2
         """, payment['id'], db_order_id)
-        # 5. The "Aware" Notification System
-        order = await conn.fetchrow("SELECT customer_phone FROM orders WHERE id = $1", db_order_id)
-        if order:
+
+        # 🚨 THE FIX: Fetch Customer Phone AND Item Names in one query
+        # This assumes you have an order_items table. 
+        order_info = await conn.fetchrow("""
+            SELECT 
+                o.customer_phone,
+                (SELECT string_agg(i.name, ', ') 
+                 FROM order_items oi 
+                 JOIN items i ON oi.item_id = i.id 
+                 WHERE oi.order_id = o.id) as item_names
+            FROM orders o 
+            WHERE o.id = $1
+        """, db_order_id)
+
+        # 5. The Unified, Single Notification System
+        if order_info and order_info['customer_phone']:
+            # Fallback text just in case the item query returns null
+            purchased_items = order_info['item_names'] or "your items"
+            
             try:
-                msg = f"🎉 *Payment Successful!*\n\nYour Order #{db_order_id} has been verified and is now processing. 📦"
-                await send_whatsapp_message(order['customer_phone'], msg)
+                msg = f"🎉 *Payment Successful!*\n\nYour order for *{purchased_items}* (Order #{db_order_id}) has been verified and is now processing. 📦"
+                await send_whatsapp_message(order_info['customer_phone'], msg)
                 
                 # Mark as Sent
                 await conn.execute("UPDATE orders SET notification_status = 'sent' WHERE id = $1", db_order_id)
@@ -264,15 +280,6 @@ async def universal_razorpay_webhook(request: Request):
                 # ⚠️ THE FAILSAFE: Mark as Failed so the Dashboard knows!
                 await conn.execute("UPDATE orders SET notification_status = 'failed' WHERE id = $1", db_order_id)
 
-        # Notify Customer Instantly (Wrapped in try/except so it doesn't crash the webhook response)
-        try:
-            await send_whatsapp_message(
-                order['customer_phone'], 
-                f"🎉 *Payment Successful!*\n\nYour Order #{db_order_id} has been auto-verified via Razorpay and is now processing."
-            )
-        except Exception as wa_error:
-            logger.error(f"Webhook WhatsApp Notification Failed: {wa_error}")
-                    
     return {"status": "ok"}
 
 
