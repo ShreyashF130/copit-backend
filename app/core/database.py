@@ -12,7 +12,6 @@ class Database:
     async def connect(self):
         db_url = os.getenv("DATABASE_URL")
         
-        # Ensure they added ?sslmode=require if it's missing
         if "?" not in db_url:
             db_url += "?sslmode=require"
         elif "sslmode=require" not in db_url:
@@ -21,18 +20,19 @@ class Database:
         retries = 3
         for i in range(retries):
             try:
-                logger.info(f"🔌 Connecting to Pooler (Attempt {i+1}/{retries})...")
+                logger.info(f"🔌 Booting Locked Pool (Attempt {i+1}/{retries})...")
                 
+                # 🚨 THE FIX: A pre-warmed, statically sized pool
                 self.pool = await asyncpg.create_pool(
                     dsn=db_url,
-                    min_size=5,             
-                    max_size=30,            
-                    statement_cache_size=0, # 🚨 MANDATORY for PgBouncer/Supabase Pooler
-                    command_timeout=15.0,   
-                    max_inactive_connection_lifetime=300
-                    # 🚨 Notice we deleted the custom 'ssl=ctx'. asyncpg will use the URL's sslmode.
+                    min_size=15,             # 🚨 Boot 15 connections immediately on startup
+                    max_size=15,             # 🚨 LOCK IT. Never try to spawn new ones under load.
+                    statement_cache_size=0,  # Mandatory for Supabase PgBouncer
+                    timeout=60.0,            # Give the server 60 seconds to establish the initial 15 connections
+                    command_timeout=30.0,    
+                    max_inactive_connection_lifetime=0 # 🚨 Stop aggressively dropping idle connections
                 )
-                logger.info("✅ DB Pool Established. Supabase accepted the connection.")
+                logger.info("✅ DB Pool Locked and Loaded. 15 SSL Lanes Open.")
                 return 
 
             except Exception as e:
@@ -41,7 +41,7 @@ class Database:
                     logger.info("🔄 Retrying in 2 seconds...")
                     await asyncio.sleep(2)
                 else:
-                    logger.critical("🔥 All connection attempts failed. Check URL Encoding!")
+                    logger.critical("🔥 Hardware/Network Starvation.")
                     raise e 
 
     async def disconnect(self):
