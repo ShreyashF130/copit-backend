@@ -25,6 +25,13 @@ logger.setLevel(logging.INFO)
 async def handle_web_handoff(phone, item_id, incoming_text="", referrer=None):
     logger.info(f"📦 START: Web Handoff for {phone} | Item: {item_id}")
     try:
+        # 🚨 THE ZOMBIE KILLER (Idempotency Check)
+        # Check if they literally just paid or are already in a checkout state
+        current_state = await state_manager.get_state(phone)
+        if current_state and current_state.get("state") in ["awaiting_screenshot", "payment_processing"]:
+            logger.warning(f"🧟‍♂️ Zombie webhook detected for {phone}. Ignoring.")
+            return # Silently exit without sending an error to the user!
+        
         # 1. 🚨 THE FIX: Extract Quantity and Variant directly from the Next.js WhatsApp message
         qty_match = re.search(r"Quantity:\s*(\d+)", incoming_text)
         quantity = int(qty_match.group(1)) if qty_match else 1
