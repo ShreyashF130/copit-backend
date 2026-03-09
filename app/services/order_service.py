@@ -24,6 +24,10 @@ logger.setLevel(logging.INFO)
 # ==============================================================================
 async def handle_web_handoff(phone, item_id, incoming_text="", referrer=None):
     logger.info(f"📦 START: Web Handoff for {phone} | Item: {item_id}")
+    if db.pool is None:
+        logger.warning(f"⚠️ Database still booting. Asked {phone} to wait.")
+        await send_whatsapp_message(phone, "⏳ Waking up the secure server... Please tap the checkout link again in 10 seconds.")
+        return
     try:
         # 🚨 THE ZOMBIE KILLER (Idempotency Check)
         # Check if they literally just paid or are already in a checkout state
