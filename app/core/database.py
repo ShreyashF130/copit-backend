@@ -12,34 +12,30 @@ class Database:
     async def connect(self):
         db_url = os.getenv("DATABASE_URL")
         
-        # 1. Add Supabase PgBouncer flags securely
-        db_url = db_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+        # Ensure standard SSL is requested natively
         if "?" not in db_url:
-            db_url += "?pgbouncer=true"
-        elif "pgbouncer=true" not in db_url:
-            db_url += "&pgbouncer=true"
+            db_url += "?sslmode=require"
+        elif "sslmode=require" not in db_url:
+            db_url += "&sslmode=require"
 
-        # 2. Relaxed SSL context for containerized cloud poolers
+        # Standard container SSL context
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        logger.info("🔌 Booting Database Pool (Dynamic DNS + AWS Firewall Bypass)...")
+        logger.info("🔌 Booting Database Pool (Direct Metal Mode on Port 5432)...")
         
         try:
-            # 3. Notice we removed host=ipv4_address! 
-            # It will dynamically resolve the correct AWS IP every time.
             self.pool = await asyncpg.create_pool(
                 dsn=db_url,
                 min_size=1,              
-                max_size=15,             
-                statement_cache_size=0,  
+                max_size=10,             
                 timeout=60.0,            
                 command_timeout=30.0,
-                ssl=ctx,                 
+                ssl=ctx,
                 
-                # AWS Firewall Fix remains to keep pipes fresh
-                max_inactive_connection_lifetime=120.0 
+                # 🚨 THE HEARTBEAT: Pings the database every 60 seconds to keep the TCP socket alive permanently
+                server_settings={'tcp_keepalives_idle': '60'} 
             )
             logger.info("✅ DB Pool Established. Ready for traffic.")
             
