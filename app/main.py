@@ -6,37 +6,49 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 from app.core.database import db
 from app.services.recovery_service import cart_recovery_loop
 from app.services.delivery_service import delivery_watchdog_loop
 from app.routers import checkout, webhook, admin, payment, storefront, dashboard
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
+# Global list to hold our background loops so we can kill them on shutdown
+background_tasks = []
 
+# 🚨 THE FIX: We move the slow database connection into its own background function
+async def background_startup_sequence():
+    logger.info("⏳ [BACKGROUND STAGE 1] Booting Database Connection Pool...")
+    try:
+        await db.connect()
+        logger.info("✅ [BACKGROUND STAGE 1 COMPLETE] Database Connected Successfully.")
+        
+        logger.info("⏳ [BACKGROUND STAGE 2] Starting Background Engines...")
+        background_tasks.append(asyncio.create_task(cart_recovery_loop()))
+        background_tasks.append(asyncio.create_task(delivery_watchdog_loop()))
+        logger.info("✅ [BACKGROUND STAGE 2 COMPLETE] Background Engines Running.")
+    except Exception as e:
+        logger.critical(f"🔥 Background Startup Failed: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(" [STAGE 1] Booting Database Connection Pool...")
-
-    await db.connect()
-    logger.info("✅ [STAGE 1 COMPLETE] Database Connected Successfully.")
+    # 1. Fire the startup sequence into the background immediately. DO NOT AWAIT IT.
+    master_startup_task = asyncio.create_task(background_startup_sequence())
     
-    logger.info("⏳ [STAGE 2] Starting Background Engines...")
-    recovery_task = asyncio.create_task(cart_recovery_loop())
-    delivery_task = asyncio.create_task(delivery_watchdog_loop())
-    logger.info("✅ [STAGE 2 COMPLETE] Background Engines Running.")
+    logger.info("🚀 SYSTEM BOOT: FastAPI opening ports instantly to satisfy Render...")
     
-    logger.info("🚀 SYSTEM ONLINE: All Systems Go. Ready for Traffic.")
-    
+    # 2. Yield immediately so Uvicorn binds to Port 10000. Render will mark deploy as SUCCESS.
     yield  
     
+    # 3. Graceful Shutdown
     logger.info("🔻 Initiating Graceful Shutdown...")
-    recovery_task.cancel()
-    delivery_task.cancel()
+    master_startup_task.cancel()
+    for task in background_tasks:
+        task.cancel()
     await db.disconnect()
     logger.info("🛑 Database Disconnected. Server Offline.")
-
 
 
 app = FastAPI(
@@ -47,8 +59,6 @@ app = FastAPI(
     docs_url="/docs",  
     redoc_url=None
 )
-
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +74,6 @@ app.include_router(payment.router, prefix="/api")
 app.include_router(storefront.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(checkout.router) 
-
 
 @app.get("/", tags=["System"])
 async def root_health_check():
