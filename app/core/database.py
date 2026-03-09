@@ -1,9 +1,7 @@
 import asyncpg
 import os
 import logging
-import socket
 import ssl
-from urllib.parse import urlparse
 
 logger = logging.getLogger("db_init")
 
@@ -14,40 +12,33 @@ class Database:
     async def connect(self):
         db_url = os.getenv("DATABASE_URL")
         
-        # 1. Parse the hostname to force IPv4
-        parsed = urlparse(db_url)
-        hostname = parsed.hostname
-        
-        # 2. 🚨 THE NETWORK BYPASS: Force Render to use IPv4
-        ipv4_address = socket.gethostbyname(hostname)
-        logger.info(f"🔌 Network Bypass: Resolved {hostname} to IPv4: {ipv4_address}")
-
-        # 3. Add Supabase PgBouncer flags (Remove sslmode=require from string)
+        # 1. Add Supabase PgBouncer flags securely
         db_url = db_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
         if "?" not in db_url:
             db_url += "?pgbouncer=true"
         elif "pgbouncer=true" not in db_url:
             db_url += "&pgbouncer=true"
 
-        # 4. 🚨 THE SSL BYPASS: Because we use a raw IP, we must disable hostname verification
+        # 2. Relaxed SSL context for containerized cloud poolers
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        logger.info("🔌 Booting Database Pool (IPv4 + AWS Firewall Bypass)...")
+        logger.info("🔌 Booting Database Pool (Dynamic DNS + AWS Firewall Bypass)...")
         
         try:
+            # 3. Notice we removed host=ipv4_address! 
+            # It will dynamically resolve the correct AWS IP every time.
             self.pool = await asyncpg.create_pool(
                 dsn=db_url,
-                host=ipv4_address,       # OVERRIDE RENDER'S DNS
                 min_size=1,              
                 max_size=15,             
-                statement_cache_size=0,  # Mandatory for Supabase PgBouncer
+                statement_cache_size=0,  
                 timeout=60.0,            
                 command_timeout=30.0,
-                ssl=ctx,                 # OVERRIDE SSL
+                ssl=ctx,                 
                 
-                # 🚨 THE AWS FIREWALL FIX: Recycle connections every 2 mins
+                # AWS Firewall Fix remains to keep pipes fresh
                 max_inactive_connection_lifetime=120.0 
             )
             logger.info("✅ DB Pool Established. Ready for traffic.")
