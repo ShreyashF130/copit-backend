@@ -1,6 +1,9 @@
 import asyncpg
 import os
 import logging
+import socket
+import ssl
+from urllib.parse import urlparse
 
 logger = logging.getLogger("db_init")
 
@@ -11,25 +14,40 @@ class Database:
     async def connect(self):
         db_url = os.getenv("DATABASE_URL")
         
-        # 1. Standard SSL & PgBouncer flags required by Supabase
-        if "?" not in db_url:
-            db_url += "?sslmode=require&pgbouncer=true"
-        elif "pgbouncer=true" not in db_url:
-            db_url += "&sslmode=require&pgbouncer=true"
+        # 1. Parse the hostname to force IPv4
+        parsed = urlparse(db_url)
+        hostname = parsed.hostname
+        
+        # 2. 🚨 THE NETWORK BYPASS: Force Render to use IPv4
+        ipv4_address = socket.gethostbyname(hostname)
+        logger.info(f"🔌 Network Bypass: Resolved {hostname} to IPv4: {ipv4_address}")
 
-        logger.info("🔌 Booting Database Pool (Native AsyncIO Mode)...")
+        # 3. Add Supabase PgBouncer flags (Remove sslmode=require from string)
+        db_url = db_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+        if "?" not in db_url:
+            db_url += "?pgbouncer=true"
+        elif "pgbouncer=true" not in db_url:
+            db_url += "&pgbouncer=true"
+
+        # 4. 🚨 THE SSL BYPASS: Because we use a raw IP, we must disable hostname verification
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        logger.info("🔌 Booting Database Pool (IPv4 + AWS Firewall Bypass)...")
         
         try:
             self.pool = await asyncpg.create_pool(
                 dsn=db_url,
+                host=ipv4_address,       # OVERRIDE RENDER'S DNS
                 min_size=1,              
                 max_size=15,             
                 statement_cache_size=0,  # Mandatory for Supabase PgBouncer
-                timeout=60.0,            # 60s tolerance for cold boots
-                command_timeout=30.0,    # Max time a single query can run
+                timeout=60.0,            
+                command_timeout=30.0,
+                ssl=ctx,                 # OVERRIDE SSL
                 
-                # 🚨 THE AWS FIREWALL FIX: Recycle connections every 2 mins 
-                # before the 5-minute AWS Load Balancer kills them silently.
+                # 🚨 THE AWS FIREWALL FIX: Recycle connections every 2 mins
                 max_inactive_connection_lifetime=120.0 
             )
             logger.info("✅ DB Pool Established. Ready for traffic.")
