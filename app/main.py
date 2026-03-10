@@ -15,10 +15,8 @@ from app.routers import checkout, webhook, admin, payment, storefront, dashboard
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-# Global list to hold our background loops so we can kill them on shutdown
 background_tasks = []
 
-# 🚨 THE FIX: We move the slow database connection into its own background function
 async def background_startup_sequence():
     logger.info("⏳ [BACKGROUND STAGE 1] Booting Database Connection Pool...")
     try:
@@ -34,15 +32,14 @@ async def background_startup_sequence():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Fire the startup sequence into the background immediately. DO NOT AWAIT IT.
+
     master_startup_task = asyncio.create_task(background_startup_sequence())
     
     logger.info("🚀 SYSTEM BOOT: FastAPI opening ports instantly to satisfy Render...")
     
-    # 2. Yield immediately so Uvicorn binds to Port 10000. Render will mark deploy as SUCCESS.
+   
     yield  
-    
-    # 3. Graceful Shutdown
+
     logger.info("🔻 Initiating Graceful Shutdown...")
     master_startup_task.cancel()
     for task in background_tasks:

@@ -27,8 +27,19 @@ async def get_analytics(shop_id: int):
             WHERE shop_id = $1 AND status != 'REJECTED'
         """, shop_id)
         
-        # 2. Daily Graph Data (Using our SQL function)
-        daily_sales = await conn.fetch("SELECT * FROM get_daily_sales($1)", shop_id)
+        # 2. 🚨 THE FIX: The Glass Box Query.
+        # We bypassed the broken custom function and wrote the exact time-series aggregation here.
+        daily_sales = await conn.fetch("""
+            SELECT 
+                DATE(created_at) as day, 
+                COALESCE(SUM(total_amount), 0) as total
+            FROM orders 
+            WHERE shop_id = $1 
+              AND created_at >= CURRENT_DATE - INTERVAL '7 days'
+              AND status != 'REJECTED'
+            GROUP BY DATE(created_at)
+            ORDER BY DATE(created_at) ASC
+        """, shop_id)
         
         # 3. Top 3 Selling Items
         top_items = await conn.fetch("""
@@ -43,11 +54,11 @@ async def get_analytics(shop_id: int):
         graph_data = []
         for r in daily_sales:
             graph_data.append({
-                "day": r['day'].strftime("%Y-%m-%d"), # Fixes Date Object issues
-                "total": float(r['total'])             # Fixes Decimal Object issues
+                # Formatted as 'Mar 10' instead of '2026-03-10' so it looks much cleaner on the Recharts X-Axis
+                "day": r['day'].strftime("%b %d"), 
+                "total": float(r['total'])             
             })
             
-  
         return {
             "status": "success",
             "stats": dict(stats),
