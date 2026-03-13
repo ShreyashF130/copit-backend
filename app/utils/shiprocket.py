@@ -174,7 +174,14 @@ import requests
 from datetime import datetime
 
 # 1. LOGIN (Standard)
+# 1. LOGIN (The Override Version)
 def get_shiprocket_token(email, password):
+    # 🚨 MOCK MODE INTERCEPTOR
+    if os.getenv("IS_TESTING_SHIPPING") == "True":
+        print("🛠️ MOCK MODE: Bypassing Shiprocket Login...")
+        return "MOCK_TOKEN_99999"
+
+    # 🚀 PRODUCTION MODE (Real Login)
     url = "https://apiv2.shiprocket.in/v1/external/auth/login"
     try:
         response = requests.post(url, json={"email": email, "password": password})
