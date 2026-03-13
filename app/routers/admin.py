@@ -17,7 +17,7 @@ COST_PER_MSG = 1.20
 @router.get("/analytics/{shop_id}")
 async def get_analytics(shop_id: int):
     async with db.pool.acquire() as conn:
-        # 1. Headline Stats
+       
         stats = await conn.fetchrow("""
             SELECT 
                 COUNT(*) as total_orders,
